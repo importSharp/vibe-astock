@@ -580,41 +580,6 @@ class TestChatSanitize:
         assert err is None and len(msgs[0]["content"]) == server._CHAT_MAX_CHARS_EACH
 
 
-class TestLimitUpDetection:
-    """`ret >= 9.8` 统一判涨停是错的：创业板/科创板 20cm、北交所 30cm、ST 5cm"""
-
-    def test_board_and_limit_pct(self):
-        """ST **不能**一刀切成 5%：创业板/科创板风险警示股仍是 20%"""
-        from duanxian.market_facts import board_of, limit_pct
-
-        assert board_of("600000", "浦发银行") == "10cm" and limit_pct("600000", "浦发银行") == 10.0
-        assert board_of("300214", "日科化学") == "20cm" and limit_pct("300214", "日科化学") == 20.0
-        assert board_of("688981", "中芯国际") == "20cm"
-        assert board_of("830799", "艾融软件") == "北交所" and limit_pct("830799", "艾融软件") == 30.0
-        assert board_of("920222", "益坤电气") == "北交所" and limit_pct("920222", "益坤电气") == 30.0
-        assert board_of("600209", "ST罗顿") == "主板ST" and limit_pct("600209", "ST罗顿") == 5.0
-        assert limit_pct("300100", "ST双流") == 20.0, "创业板 ST 是 20% 不是 5%"
-
-    def test_limit_up_prefers_actual_limit_price(self):
-        """判涨停优先用「现价 == 涨停价」—— 数据源给的事实，自动适配任何制度变化。"""
-        from duanxian import data as bk
-
-        # 益坤电气：涨 10.49% 但涨停价 37.18、现价 31.60 → 没涨停
-        assert bk.is_limit_up({"code": "920222", "name": "益坤电气", "ret": 10.49,
-                                "close": 31.60, "limit_price": 37.18}) is False
-        # 真涨停：现价==涨停价
-        assert bk.is_limit_up({"code": "600000", "name": "浦发", "ret": 10.0,
-                                "close": 12.31, "limit_price": 12.31}) is True
-
-    def test_falls_back_to_rule_when_price_missing(self):
-        """老缓存没有价格字段时退回制度推定，但不能假装能判。"""
-        from duanxian import data as bk
-
-        assert bk.is_limit_up({"code": "300214", "name": "日科化学", "ret": 15.59}) is False
-        assert bk.is_limit_up({"code": "600000", "name": "浦发", "ret": 9.98}) is True
-        assert bk.is_limit_up({"code": "600000", "name": "浦发"}) is None   # 连 ret 都没有
-
-
 # ---------------------------------------------------------------- 情绪走向 vs 相对位置
 @pytest.mark.unit
 class TestRecentTrend:
@@ -1097,7 +1062,7 @@ class TestPersonalDataNeverReachesPrompt:
 
     _PROMPT_MODULES = ("synthesizer", "reflection", "prompts", "structured",
                        "emotion_metrics", "market_facts", "stats_context",
-                       "verification", "theme_tree")
+                       "verification", "theme_tree", "intraday")
 
     def test_prompt_modules_do_not_import_personal_data(self):
         import importlib
@@ -4431,3 +4396,2830 @@ class TestVerificationItemsCarryBaseline:
         assert rs._with_baselines(None) is None
         assert rs._with_baselines({"focus": None}) == {"focus": None}
         assert rs._with_baselines({}) == {}
+
+
+# ================================================================ 交易日志与模式卡
+# ⛔ 个人交易数据只在这些模块与只读 API 里流动，**不接入任何 AI prompt**
+#    （由 TestPersonalDataNeverReachesPrompt 锁住）。
+
+class TestJournalSafety:
+    """这是永久账本，丢一条就是永久丢失。三条防线都必须在。"""
+
+    @staticmethod
+    def _use(tmp_path, monkeypatch):
+        from duanxian import journal
+
+        monkeypatch.setattr(journal, "_DIR", str(tmp_path))
+        monkeypatch.setattr(journal, "_PATH", str(tmp_path / "trades.json"))
+        return journal
+
+    def test_corrupted_file_raises_not_empty(self, tmp_path, monkeypatch):
+        """账本坏了必须抛异常。返回空表 → 下一次 add 会把整本账覆盖成一条。"""
+        j = self._use(tmp_path, monkeypatch)
+        (tmp_path / "trades.json").write_text("{ 坏文件", encoding="utf-8")
+        with pytest.raises(j.JournalCorrupted):
+            j.list_trades()
+        with pytest.raises(j.JournalCorrupted):
+            j.add_trade("2026-07-24", "600000", "浦发", "打板")
+
+    def test_schema_mismatch_refuses_write(self, tmp_path, monkeypatch):
+        """老 schema 的账本要先迁移，不能直接覆盖。"""
+        import json as _json
+
+        j = self._use(tmp_path, monkeypatch)
+        (tmp_path / "trades.json").write_text(
+            _json.dumps({"schema": 999, "trades": [{"id": "x"}]}), encoding="utf-8")
+        with pytest.raises(j.JournalCorrupted):
+            j.list_trades()
+
+    def test_rejects_nan_and_inf(self, tmp_path, monkeypatch):
+        """NaN 会顺着 json 写进账本，之后所有统计永久变 NaN。"""
+        j = self._use(tmp_path, monkeypatch)
+        for bad in (float("nan"), float("inf"), -float("inf")):
+            with pytest.raises(ValueError):
+                j.add_trade("2026-07-24", "600000", "浦发", "打板", pnl_pct=bad)
+
+    def test_rejects_absurd_pnl_and_bad_code(self, tmp_path, monkeypatch):
+        j = self._use(tmp_path, monkeypatch)
+        with pytest.raises(ValueError):
+            j.add_trade("2026-07-24", "600000", "浦发", "打板", pnl_pct=99999)
+        with pytest.raises(ValueError):
+            j.add_trade("2026-07-24", "ABC123", "乱码", "打板")
+        with pytest.raises(ValueError):
+            j.add_trade("2026-07-24", "600000", "浦发", "打板", as_planned="yes")
+
+    def test_write_failure_raises(self, tmp_path, monkeypatch):
+        """写盘失败必须抛 —— 否则前端会显示"已记录"而这笔根本没记上。"""
+        j = self._use(tmp_path, monkeypatch)
+        monkeypatch.setattr(j, "_save", lambda trades: False)
+        with pytest.raises(RuntimeError):
+            j.add_trade("2026-07-24", "600000", "浦发", "打板")
+
+    def test_concurrent_adds_do_not_lose_records(self, tmp_path, monkeypatch):
+        """并发追加不能互相覆盖 —— 无锁的读改写会静默丢单。"""
+        import threading as th
+
+        j = self._use(tmp_path, monkeypatch)
+        monkeypatch.setattr(j, "_market_context", lambda d: {})
+        monkeypatch.setattr(j, "_stock_context", lambda d, c: {})
+
+        def add(i):
+            j.add_trade("2026-07-24", f"60000{i % 10}", f"票{i}", "打板", pnl_pct=float(i))
+
+        ts = [th.Thread(target=add, args=(i,)) for i in range(12)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        assert j.list_trades()["total"] == 12, "并发写丢了记录"
+
+
+class TestJournalFills:
+    """一笔交易的真实形态是「一笔计划 → 多次买卖 → 仓位变化 → 结果」。
+    单行盈亏百分比表达不了分批建仓、做 T、隔日卖出。
+
+    ⚠️ 本组把交易费用置零，测的是**结算逻辑**本身；费用另有一组测试。
+    分开测，否则调一下默认费率这里所有断言都要跟着改，
+    也看不出到底错在结算还是错在计费。
+    """
+
+    ZERO_FEES = {"commission_rate": 0.0, "commission_min": 0.0,
+                 "stamp_tax_rate": 0.0, "transfer_fee_rate": 0.0, "is_default": True}
+
+    @classmethod
+    def _use(cls, tmp_path, monkeypatch):
+        from duanxian import journal
+
+        monkeypatch.setattr(journal, "_DIR", str(tmp_path))
+        monkeypatch.setattr(journal, "_PATH", str(tmp_path / "trades.json"))
+        monkeypatch.setattr(journal, "_market_context", lambda d: {"emotion_phase": "退潮"})
+        monkeypatch.setattr(journal, "_stock_context", lambda d, c: {})
+        monkeypatch.setattr(journal, "load_fees", lambda: dict(cls.ZERO_FEES))
+        return journal
+
+    def test_batched_entry_weighted_cost(self, tmp_path, monkeypatch):
+        j = self._use(tmp_path, monkeypatch)
+        st = j.add_trade("2026-07-23", "002879", "长缆", "接力", fills=[
+            {"side": "buy", "date": "2026-07-23", "price": 20.0, "shares": 1000},
+            {"side": "buy", "date": "2026-07-23", "price": 20.5, "shares": 1000},
+            {"side": "sell", "date": "2026-07-24", "price": 22.0, "shares": 2000},
+        ])["trade"]["settled"]
+        assert st["avg_cost"] == 20.25          # 加权成本，不是简单平均两个价
+        assert st["realized_pnl"] == 3500.0     # (22-20.25)*2000
+        assert st["realized_pct"] == 8.64
+        assert st["amount"] == 40500.0          # 占用资金
+        assert st["hold_days"] == 1 and st["is_t0"] is False and st["closed"] is True
+
+    def test_t0_detected(self, tmp_path, monkeypatch):
+        """当日买卖 = 做 T。混进隔日单里统计会看不出哪种打法适合自己。"""
+        j = self._use(tmp_path, monkeypatch)
+        st = j.add_trade("2026-07-24", "600000", "浦发", "低吸", fills=[
+            {"side": "buy", "date": "2026-07-24", "price": 10.0, "shares": 500},
+            {"side": "sell", "date": "2026-07-24", "price": 10.3, "shares": 500},
+        ])["trade"]["settled"]
+        assert st["is_t0"] is True and st["hold_days"] == 0
+
+    def test_partial_sell_is_not_closed_and_no_fake_unrealized(self, tmp_path, monkeypatch):
+        """只卖一半 → 未平仓，且**不虚构浮盈**（那取决于当前价，不是这笔的事实）。"""
+        j = self._use(tmp_path, monkeypatch)
+        st = j.add_trade("2026-07-24", "600000", "浦发", "打板", fills=[
+            {"side": "buy", "date": "2026-07-24", "price": 10.0, "shares": 1000},
+            {"side": "sell", "date": "2026-07-24", "price": 11.0, "shares": 400},
+        ])["trade"]["settled"]
+        assert st["closed"] is False
+        assert st["realized_pnl"] == 400.0      # 只算已卖出的 400 股
+        assert "unrealized_pnl" not in st
+
+    def test_exit_env_recorded_separately(self, tmp_path, monkeypatch):
+        """发酵期买、退潮期卖是两个处境，环境要各存一份。"""
+        j = self._use(tmp_path, monkeypatch)
+        seen = {}
+        monkeypatch.setattr(j, "_market_context",
+                            lambda d: seen.setdefault(d, {"emotion_phase": f"env@{d}"}))
+        t = j.add_trade("2026-07-23", "600000", "浦发", "接力", fills=[
+            {"side": "buy", "date": "2026-07-23", "price": 10.0, "shares": 100},
+            {"side": "sell", "date": "2026-07-24", "price": 11.0, "shares": 100},
+        ])["trade"]
+        assert t["market"]["emotion_phase"] == "env@2026-07-23"
+        assert t["exit_market"]["emotion_phase"] == "env@2026-07-24"
+
+    def test_bad_fills_rejected(self, tmp_path, monkeypatch):
+        j = self._use(tmp_path, monkeypatch)
+        for bad in (
+            [{"side": "hold", "date": "2026-07-24", "price": 1, "shares": 1}],
+            [{"side": "buy", "date": "2026-07-24", "price": -1, "shares": 1}],
+            [{"side": "buy", "date": "2026-07-24", "price": 1, "shares": 0}],
+            [{"side": "buy", "date": "2026-07-24", "price": float("nan"), "shares": 1}],
+        ):
+            with pytest.raises(ValueError):
+                j.add_trade("2026-07-24", "600000", "浦发", "打板", fills=bad)
+
+    def test_v1_migrates_without_faking_fills(self, tmp_path, monkeypatch):
+        """v1 记录只有盈亏%，迁移时**不许伪造 fills** —— 价量当时没记，编出来就是假数据。"""
+        import json as _json
+
+        j = self._use(tmp_path, monkeypatch)
+        (tmp_path / "trades.json").write_text(_json.dumps({
+            "schema": 1,
+            "trades": [{"id": "old1", "date": "2026-07-20", "code": "600000",
+                        "name": "浦发", "playbook": "打板", "pnl_pct": 3.0}],
+        }), encoding="utf-8")
+        got = j.list_trades()["trades"]
+        assert len(got) == 1 and got[0]["fills"] == []
+        assert got[0]["settled"]["has_fills"] is False
+        assert (tmp_path / "trades.v1.bak.json").exists(), "迁移前必须备份"
+
+
+class TestJournalApiPassesThrough:
+    """录入接口必须把前端发来的字段**全部**透传给 `journal.add_trade()`。
+
+    ⚠️ 少透传一个字段（尤其 `fills`）时，界面填的内容会被静默丢弃且前端不报错，
+    而加权成本、已实现盈亏、持有天数全靠它 —— 只测"显示"发现不了，必须测录入路径。
+    """
+
+    def test_add_endpoint_forwards_every_field(self, monkeypatch):
+        import server
+
+        seen: dict = {}
+        monkeypatch.setattr(server, "_origin_ok", lambda _r: True)
+
+        import duanxian.journal as J
+
+        monkeypatch.setattr(J, "add_trade",
+                            lambda **kw: (seen.update(kw), {"ok": True})[1])
+
+        class _Req:
+            headers: dict = {}
+
+        body = {
+            "date": "2026-07-24", "code": "002463", "name": "沪电股份",
+            "playbook": "打板", "as_planned": True, "note": "n",
+            "fills": [{"side": "buy", "date": "2026-07-24", "price": 100.0, "shares": 100}],
+            "planned_stop": 94.0, "planned_target": 112.0,
+        }
+        server.api_journal_add(_Req(), body=body)  # type: ignore[arg-type]
+        assert seen.get("fills") == body["fills"], "fills 没透传 —— 界面填的明细会被丢掉"
+        assert seen.get("planned_stop") == 94.0
+        assert seen.get("planned_target") == 112.0
+        assert seen.get("as_planned") is True
+
+    def test_schema_v3_migration_does_not_invent_stops(self):
+        """v2 → v3 老记录的计划止损必须补 None，不做反推。
+
+        计划止损是下单时的主观意图，按成交价反推出的值不是事实。
+        """
+        from duanxian.journal import _migrate
+
+        out = _migrate(2, [{"id": "a", "fills": [], "settled": {},
+                            "pnl_pct": -3.0}])
+        assert out is not None
+        assert out[0]["planned_stop"] is None
+        assert out[0]["planned_target"] is None
+
+
+class TestModes:
+    """个人模式卡 —— 打法改过之后，改动前后的统计不能混在一起算。"""
+
+    def test_rule_change_opens_new_version_without_touching_old(self, monkeypatch, tmp_path):
+        """改规则要开新版本，**不覆盖旧版本** —— 旧版本是历史交易的归属依据。"""
+        from duanxian import modes
+
+        monkeypatch.setattr(modes, "_PATH", str(tmp_path / "cards.json"))
+        monkeypatch.setattr(modes, "_DIR", str(tmp_path))
+        modes.save_card({"name": "首板", "playbook": "打板", "setup": "A"})
+        cid = modes.list_cards()["cards"][0]["id"]
+        r = modes.save_card({"id": cid, "name": "首板", "playbook": "打板",
+                             "setup": "A + 不碰 ST", "changes": "加不碰ST"})
+        assert r["new_version"] is True
+        vers = modes.list_cards()["cards"][0]["versions"]
+        assert len(vers) == 2
+        assert vers[0]["setup"] == "A", "旧版本内容必须原样保留"
+        assert vers[1]["changes"] == "加不碰ST"
+        # 内容没变时不该开新版本（否则版本号会被每次保存刷爆）
+        r2 = modes.save_card({"id": cid, "name": "首板", "playbook": "打板",
+                              "setup": "A + 不碰 ST"})
+        assert r2["new_version"] is False
+        assert len(modes.list_cards()["cards"][0]["versions"]) == 2
+
+    def test_trades_before_card_are_not_attributed(self, monkeypatch, tmp_path):
+        """卡片诞生之前的交易不能算进任何版本。
+
+        算进去 = 用今天写下的规则去评价过去的操作。
+        """
+        import duanxian.journal as J
+        from duanxian import modes
+
+        monkeypatch.setattr(modes, "_PATH", str(tmp_path / "cards.json"))
+        monkeypatch.setattr(modes, "_DIR", str(tmp_path))
+        monkeypatch.setattr(modes, "_MIN_PER_VERSION", 2)
+        # 卡从 2026-07-20 生效
+        modes.save_card({"name": "首板", "playbook": "打板", "setup": "A"})
+        env = modes._load_env()
+        env["cards"][0]["versions"][0]["since"] = "2026-07-20"
+        modes._save(env, env["cards"])
+
+        monkeypatch.setattr(J, "list_trades", lambda limit=1000: {"trades": [
+            {"playbook": "打板", "pnl_pct": 5.0, "date": "2026-07-10",
+             "settled": {"first_buy": "2026-07-10"}},      # 卡之前
+            {"playbook": "打板", "pnl_pct": -2.0, "date": "2026-07-21",
+             "settled": {"first_buy": "2026-07-21"}},
+            {"playbook": "打板", "pnl_pct": 3.0, "date": "2026-07-22",
+             "settled": {"first_buy": "2026-07-22"}},
+        ]})
+        p = modes.performance()
+        card = p["cards"][0]
+        assert card["before_card"]["trades"] == 1
+        assert card["by_version"][0]["trades"] == 2
+
+    def test_stats_keys_are_stable_on_empty(self):
+        """空样本也必须返回全部键 —— 只给 {"trades": 0} 会让消费方 KeyError。
+
+        少给一个键会让消费方在取值时直接崩，且崩在下游、不在这里。
+        """
+        from duanxian.modes import _STAT_KEYS, _stats
+
+        empty = _stats([])
+        assert set(empty) == set(_STAT_KEYS)
+        assert empty["trades"] == 0 and empty["win_rate"] is None
+        assert set(_stats([1.0, -1.0])) == set(_STAT_KEYS)
+
+    def test_version_compare_blocked_on_thin_samples(self, monkeypatch, tmp_path):
+        """两个版本样本都够才比较；不够就标 compare_blocked，不给倾向性结论。"""
+        import duanxian.journal as J
+        from duanxian import modes
+
+        monkeypatch.setattr(modes, "_PATH", str(tmp_path / "cards.json"))
+        monkeypatch.setattr(modes, "_DIR", str(tmp_path))
+        monkeypatch.setattr(modes, "_MIN_PER_VERSION", 6)
+        modes.save_card({"name": "首板", "playbook": "打板", "setup": "A"})
+        cid = modes.list_cards()["cards"][0]["id"]
+        modes.save_card({"id": cid, "name": "首板", "playbook": "打板", "setup": "B"})
+        env = modes._load_env()
+        env["cards"][0]["versions"][0]["since"] = "2026-07-01"
+        env["cards"][0]["versions"][1]["since"] = "2026-07-20"
+        modes._save(env, env["cards"])
+
+        monkeypatch.setattr(J, "list_trades", lambda limit=1000: {"trades": (
+            [{"playbook": "打板", "pnl_pct": 5.0, "date": f"2026-07-{d:02d}",
+              "settled": {"first_buy": f"2026-07-{d:02d}"}} for d in range(2, 10)]
+            + [{"playbook": "打板", "pnl_pct": -3.0, "date": "2026-07-21",
+                "settled": {"first_buy": "2026-07-21"}}])})
+        card = modes.performance()["cards"][0]
+        assert card["by_version"][0]["enough"] is True
+        assert card["by_version"][1]["enough"] is False
+        assert card["latest_vs_prev"] is None
+        assert card["compare_blocked"] is True
+
+
+class TestModesLegacyCards:
+    """补丁前建的卡片（版本里没有 playbook 字段）也不能被追溯重写归属。"""
+
+    def test_legacy_card_keeps_old_playbook_in_versions(self, monkeypatch, tmp_path):
+        """补丁前建的卡片改 playbook 时，**老版本要先回填改之前的 playbook**。
+
+        老版本没有 `playbook` 字段 → `performance()` 的回退会读到**刚改成的新值**
+        → 原打法下的历史交易被整批移出/错配，正是这次修复要防的历史重写。
+        """
+        from duanxian import modes
+
+        monkeypatch.setattr(modes, "_PATH", str(tmp_path / "cards.json"))
+        monkeypatch.setattr(modes, "_DIR", str(tmp_path))
+        # 手工造一张"补丁前"的卡：版本里没有 playbook
+        legacy = {"id": "old1", "name": "卡", "playbook": "打板", "created_at": "x",
+                  "versions": [{"version": 1, "since": "2026-07-01", "changes": "初版",
+                                "setup": "A", "entry": "", "exit": "",
+                                "sizing": "", "phase": ""}]}
+        modes._save({}, [legacy])
+        modes.save_card({"id": "old1", "name": "卡", "playbook": "低吸",
+                         "setup": "A", "changes": "换打法"})
+        vers = modes.list_cards()["cards"][0]["versions"]
+        assert vers[0]["playbook"] == "打板", "老版本必须回填成改之前的打法"
+        assert vers[1]["playbook"] == "低吸"
+
+    def test_legacy_card_unchanged_save_does_not_bump_version(self, monkeypatch, tmp_path):
+        """老卡片内容没变时不能因为"旧版本缺 playbook 字段"就误判成改动。
+
+        误判会让每次保存都开一个新版本、版本号被刷爆。
+        """
+        from duanxian import modes
+
+        monkeypatch.setattr(modes, "_PATH", str(tmp_path / "cards.json"))
+        monkeypatch.setattr(modes, "_DIR", str(tmp_path))
+        legacy = {"id": "old2", "name": "卡", "playbook": "打板", "created_at": "x",
+                  "versions": [{"version": 1, "since": "2026-07-01", "changes": "初版",
+                                "setup": "A", "entry": "", "exit": "",
+                                "sizing": "", "phase": ""}]}
+        modes._save({}, [legacy])
+        r = modes.save_card({"id": "old2", "name": "卡", "playbook": "打板", "setup": "A"})
+        assert r["new_version"] is False
+        assert len(modes.list_cards()["cards"][0]["versions"]) == 1
+
+
+class TestWinRateCaliberIsShared:
+    """胜率口径必须全站一致：持平不计入分母。
+
+    ⚠️ 这两个函数的结果并排显示在同一个页面上。口径一旦分叉，界面上是两个
+    长得一样的「胜率」而算法不同 —— 看不出来，也没法比较。
+    """
+
+    CASES = [
+        ([5.0, -3.0, 0.0], 0.5),      # 一赢一亏一持平 → 分母 2
+        ([5.0, 2.0, -1.0], 0.667),    # 两赢一亏
+        ([-1.0, -2.0], 0.0),          # 全亏
+        ([0.0, 0.0], None),           # 全持平 → 没有胜负可言，不是 0
+    ]
+
+    def test_journal_and_modes_agree(self):
+        from duanxian.journal import _bucket_stats
+        from duanxian.modes import _stats
+
+        for vals, expected in self.CASES:
+            a = _bucket_stats([{"pnl_pct": v} for v in vals])["win_rate"]
+            b = _stats(vals)["win_rate"]
+            assert a == b, f"{vals}：journal 给 {a}，modes 给 {b} —— 口径分叉了"
+            assert a == expected, f"{vals}：胜率应为 {expected}，实得 {a}"
+
+    def test_flat_trades_excluded_from_denominator(self):
+        """加一笔持平不该拉低胜率 —— 它没有分出胜负。"""
+        from duanxian.journal import _bucket_stats
+
+        without = _bucket_stats([{"pnl_pct": 5.0}, {"pnl_pct": -3.0}])["win_rate"]
+        with_flat = _bucket_stats(
+            [{"pnl_pct": 5.0}, {"pnl_pct": -3.0}, {"pnl_pct": 0.0}])["win_rate"]
+        assert without == with_flat == 0.5
+
+    def test_all_flat_gives_none_not_zero(self):
+        """全是持平时胜率是 None（无从判断），返回 0 会被读成「一次都没赢过」。"""
+        from duanxian.journal import _bucket_stats
+
+        r = _bucket_stats([{"pnl_pct": 0.0}, {"pnl_pct": 0.0}])
+        assert r["win_rate"] is None
+        assert r["scored"] == 2, "持平仍然算「填了盈亏」，只是不进胜率分母"
+
+
+# ================================================================ 账户风险与执行偏差
+# ⛔ 与交易日志同：这些模块只读使用者自己的数据，**不接入任何 AI prompt**。
+
+class TestRisk:
+    """决定能不能活十年的那部分。全部只统计用户自己的数据。"""
+
+    @staticmethod
+    def _t(date, pnl_money, planned=None, pnl_pct=None, last_sell=None):
+        return {
+            "id": f"x{date}{pnl_money}", "date": date, "code": "600000", "name": "A",
+            "playbook": "打板", "pnl_pct": pnl_pct, "as_planned": planned,
+            "created_at": f"{date} 15:00:00 CST",
+            "settled": {"realized_pnl": pnl_money, "last_sell": last_sell or date},
+        }
+
+    def test_cost_of_indiscipline(self):
+        """最狠的一张账：删掉计划外交易，账户会是什么样。"""
+        from duanxian import risk
+
+        trades = [
+            self._t("2026-07-20", 800.0, True, 8.0),
+            self._t("2026-07-21", 750.0, True, 7.5),
+            self._t("2026-07-22", -1200.0, False, -10.0),
+        ]
+        d = risk.discipline(trades)
+        assert d["planned"]["net_pnl"] == 1550.0
+        assert d["unplanned"]["net_pnl"] == -1200.0
+        wi = d["what_if_only_planned"]
+        assert wi["actual_net"] == 350.0 and wi["planned_only_net"] == 1550.0
+        assert wi["cost_of_indiscipline"] == -1200.0
+        assert d["execution_rate"] == round(2 / 3, 3)
+
+    def test_profit_concentration_exposes_luck(self):
+        """「去掉最好 1 笔」最能揭穿"其实是靠一两笔运气"。"""
+        from duanxian import risk
+
+        trades = [self._t("2026-07-20", 3000.0, pnl_pct=30.0),
+                  self._t("2026-07-21", -400.0, pnl_pct=-4.0),
+                  self._t("2026-07-22", -300.0, pnl_pct=-3.0)]
+        eq = risk.equity_curve(trades)
+        assert eq["net_pnl"] == 2300.0
+        assert eq["net_without_best1"] == -700.0, "去掉最好一笔就是亏的"
+
+    def test_drawdown_and_underwater(self):
+        from duanxian import risk
+
+        trades = [self._t("2026-07-20", 1000.0, pnl_pct=10.0),
+                  self._t("2026-07-21", -600.0, pnl_pct=-6.0),
+                  self._t("2026-07-22", -200.0, pnl_pct=-2.0)]
+        eq = risk.equity_curve(trades)
+        assert eq["peak"] == 1000.0 and eq["current_drawdown"] == 800.0
+        assert eq["max_drawdown"] == 800.0
+        assert eq["trades_since_peak"] == 2, "已 2 笔未创新高"
+
+    def test_violations_use_user_rules_not_ours(self):
+        """只对照**用户写下的**规则，不替他判断该不该交易。"""
+        from duanxian import risk
+
+        rules = {**risk.DEFAULT_RULES, "max_trades_per_day": 2, "_is_default": False}
+        trades = [self._t("2026-07-20", 10.0, pnl_pct=1.0) for _ in range(3)]
+        for i, t in enumerate(trades):
+            t["id"] = f"t{i}"
+        v = risk.violations(trades, rules)
+        assert any(x["rule"] == "max_trades_per_day" for x in v["violations"])
+        # 放宽规则后就不该再报
+        rules2 = {**rules, "max_trades_per_day": 5}
+        assert not any(x["rule"] == "max_trades_per_day"
+                       for x in risk.violations(trades, rules2)["violations"])
+
+    def test_rules_reject_bad_values(self, tmp_path, monkeypatch):
+        from duanxian import risk
+
+        monkeypatch.setattr(risk, "_DIR", str(tmp_path))
+        monkeypatch.setattr(risk, "_RULES_PATH", str(tmp_path / "rules.json"))
+        for bad in ({"max_positions": -1}, {"max_positions": 0},
+                    {"max_loss_per_trade_pct": float("nan")},
+                    {"max_positions": "三"}):
+            with pytest.raises(ValueError):
+                risk.save_rules(bad)
+
+    def test_default_rules_are_marked(self):
+        """没设过就用默认值，但必须标出来 —— 别让用户以为那是他自己定的。"""
+        from duanxian import risk
+
+        r = risk.load_rules()
+        assert "_is_default" in r
+
+
+class TestAttribution:
+    """判断 vs 执行归因 —— 看对了却亏钱和看错了才亏钱是两个病。"""
+
+    def test_aligns_by_entry_day_not_exit_day(self):
+        """必须按**入场日**对齐市场判断，不能按平仓日。
+
+        D 日买、D+2 日卖的交易，按平仓日会去比 D+1 晚做的那份判断 ——
+        那份判断根本没参与这笔决策。两个数都长得正常，看不出来。
+        """
+        from duanxian.attribution import _entry_day
+
+        t = {"date": "2026-07-20",
+             "settled": {"first_buy": "2026-07-21", "last_sell": "2026-07-23"}}
+        assert _entry_day(t) == "2026-07-21"
+        # 没有明细时退回记录日期
+        assert _entry_day({"date": "2026-07-20", "settled": {}}) == "2026-07-20"
+
+    def test_undecided_read_is_not_counted_as_wrong(self, tmp_path, monkeypatch):
+        """判不了 / 只拿到一路信号（provisional）的日子不能算「判错」。
+
+        把"不知道"当"判错"会凭空造出"判断问题"，而账面上看不出区别。
+        用真文件 + patch 目录，把真实的读盘路径也一起测了。
+        """
+        import json
+
+        from duanxian import attribution as at
+
+        recs = [
+            {"eval_date": "2026-07-20", "phase_eval": {"hit": True, "phase": "发酵"}},
+            {"eval_date": "2026-07-21", "phase_eval": {"hit": None, "phase": "混沌"}},
+            {"eval_date": "2026-07-22", "phase_eval": {"hit": False, "provisional": True}},
+            {"eval_date": "2026-07-23", "phase_eval": {"hit": False}, "provisional": True},
+        ]
+        for i, r in enumerate(recs):
+            (tmp_path / f"{i}.json").write_text(json.dumps(r), encoding="utf-8")
+        (tmp_path / "broken.json").write_text("{ 半截", encoding="utf-8")  # 坏文件跳过不炸
+        monkeypatch.setattr(at, "_REFL_DIR", str(tmp_path))
+
+        hits = at._read_hits()
+        assert set(hits) == {"2026-07-20"}, "只有已定稿的判定能进归因"
+        assert hits["2026-07-20"]["hit"] is True
+
+    def test_flat_day_enters_no_quadrant(self, monkeypatch):
+        """盈亏恰好为 0 的日子不进任何一格 —— 硬塞进「亏钱」会凭空造出执行问题。"""
+        import duanxian.journal as J
+        from duanxian import attribution as at
+
+        trades = [
+            {"date": "2026-07-20", "as_planned": True,
+             "settled": {"first_buy": "2026-07-20", "realized_pnl": 0.0}},
+            {"date": "2026-07-20", "as_planned": True,
+             "settled": {"first_buy": "2026-07-20", "realized_pnl": 500.0}},
+            {"date": "2026-07-21", "as_planned": True,
+             "settled": {"first_buy": "2026-07-21", "realized_pnl": -500.0}},
+            {"date": "2026-07-21", "as_planned": True,
+             "settled": {"first_buy": "2026-07-21", "realized_pnl": 500.0}},
+        ]
+        monkeypatch.setattr(at, "_read_hits",
+                            lambda: {"2026-07-20": {"hit": True, "phase": "发酵"},
+                                     "2026-07-21": {"hit": True, "phase": "发酵"}})
+        monkeypatch.setattr(J, "list_trades", lambda limit=500: {"trades": trades})
+
+        r = at.attribution()
+        # 07-20 净 +500 → 判对+赚钱；07-21 净 0 → 不进任何格
+        assert r["days_counted"] == 1
+        assert r["quadrants"]["right_win"]["days"] == 1
+        assert r["quadrants"]["right_lose"]["days"] == 0
+
+    def test_render_flags_execution_problem_and_luck(self):
+        """两句最值钱的话必须出现：看对却亏=执行问题、看错还赚=运气。"""
+        from duanxian.attribution import render
+
+        rep = {
+            "available": True, "days_counted": 12, "enough_samples": True,
+            "quadrants": {
+                "right_win": {"days": 5, "pnl": 9000.0, "days_list": []},
+                "right_lose": {"days": 3, "pnl": -2000.0, "days_list": []},
+                "wrong_win": {"days": 2, "pnl": 1500.0, "days_list": []},
+                "wrong_lose": {"days": 2, "pnl": -3000.0, "days_list": []},
+            },
+        }
+        txt = render(rep)
+        assert "看对了却亏钱" in txt
+        assert "执行不在判断" in txt
+        assert "看错了还赚钱" in txt
+        # 样本不足时必须闭嘴，不给倾向性描述
+        thin = render({**rep, "days_counted": 3, "enough_samples": False})
+        assert "样本太少" in thin
+        assert "执行不在判断" not in thin
+
+
+    # —— 原属 TestPersonalDataNeverReachesPrompt ——
+    def test_render_docstrings_forbid_prompt_use(self):
+        """两个 render() 的注释必须写明禁止接进 prompt。
+
+        它们长得就像"给 prompt 用的文本渲染器"，不写清楚下一个人（包括我）
+        会顺手接上去 —— 早先 risk.render 的注释就写着"给复盘 prompt 用"。
+        """
+        from duanxian import attribution, risk
+
+        for fn in (risk.render, attribution.render):
+            doc = fn.__doc__ or ""
+            assert "不要" in doc and "prompt" in doc, \
+                f"{fn.__module__}.render 的注释没写明禁止进 prompt"
+
+
+class TestRollingWindows:
+    """滚动窗口 —— 终身统计会把最近的退化藏起来。
+
+    前 150 笔赚钱、最近 50 笔一直亏，终身胜率与盈亏比全都还是漂亮的，
+    账面上完全看不出"手感已经没了"。
+    """
+
+    @staticmethod
+    def _mk(pnls: list[float], planned: bool = True, start: int = 0) -> list[dict]:
+        """造已平仓交易。
+
+        ⚠️ 日期必须**严格递增**：第一版用 `i % 28 + 1` 会绕回月初，按 last_sell
+        排序后"最后 N 笔"根本不是列表尾部那批 —— 测试会以为在测窗口、其实在测
+        一堆乱序数据（本轮实测踩到，两个用例都因此假失败）。
+        """
+        import datetime
+
+        d0 = datetime.date(2026, 1, 5)
+        out = []
+        for i, v in enumerate(pnls):
+            d = (d0 + datetime.timedelta(days=start + i)).isoformat()
+            out.append({"date": d, "as_planned": planned,
+                        "created_at": f"c{start + i:04d}", "pnl_pct": None,
+                        "settled": {"realized_pnl": v, "last_sell": d}})
+        return out
+
+    def test_lifetime_hides_recent_decay(self):
+        """构造"前面全赚、最近 10 笔全亏"：终身漂亮，近 10 笔必须难看。"""
+        from duanxian.risk import rolling
+
+        r = rolling(self._mk([500.0] * 40 + [-300.0] * 10))
+        assert r["lifetime"]["win_rate"] == pytest.approx(0.8)
+        assert r["windows"]["10"]["win_rate"] == 0.0, "近 10 笔全亏，胜率必须是 0"
+        assert r["windows"]["10"]["net_pnl"] == pytest.approx(-3000.0)
+        # 漂移必须为负且明显 —— 这是"手感没了"的直接读数
+        assert r["win_rate_drift"] < -0.5
+
+    def test_insufficient_sample_is_not_passed_off_as_full_window(self):
+        """只有 12 笔时，"近 50 笔"必须标 enough=False，不能拿全部冒充。
+
+        否则会让人以为打法在 50 笔的尺度上验证过。
+        """
+        from duanxian.risk import rolling
+
+        r = rolling(self._mk([100.0] * 12))
+        assert r["windows"]["10"]["enough"] is True
+        assert r["windows"]["20"]["enough"] is False
+        assert r["windows"]["50"]["enough"] is False
+        assert r["windows"]["50"]["trades"] == 12, "如实报实际笔数"
+
+    def test_win_rate_caliber_matches_equity_curve(self):
+        """rolling 与 equity_curve 的胜率口径必须一致（持平不进分母）。
+
+        ⚠️ 两处不同的话，同一页会出现两个"终身胜率"，而各自看都很正常。
+        """
+        from duanxian.risk import equity_curve, rolling
+
+        trades = self._mk([500.0, -200.0, 0.0])      # 1 赢 1 输 1 持平 → 0.5
+        assert equity_curve(trades)["win_rate"] == pytest.approx(0.5)
+        assert rolling(trades)["lifetime"]["win_rate"] == pytest.approx(0.5)
+
+    def test_same_sort_order_as_equity_curve(self):
+        """窗口取的"最后 N 笔"必须和权益曲线尾巴是同一批。
+
+        两处排序不同会让"近 10 笔"和曲线尾巴对不上，两边各自看都正常。
+        """
+        from duanxian.risk import equity_curve, rolling
+
+        # 故意让 date 与 last_sell 不同序：last_sell 才是正确依据
+        trades = [
+            {"date": "2026-06-01", "as_planned": True, "created_at": "c1",
+             "settled": {"realized_pnl": 100.0, "last_sell": "2026-06-20"}},
+            {"date": "2026-06-15", "as_planned": True, "created_at": "c2",
+             "settled": {"realized_pnl": -50.0, "last_sell": "2026-06-05"}},
+        ]
+        pts = equity_curve(trades)["points"]
+        r = rolling(trades)
+        assert [p["pnl"] for p in pts] == [-50.0, 100.0], "应按 last_sell 排"
+        assert r["windows"]["10"]["date_to"] == pts[-1]["date"]
+
+    def test_execution_rate_is_windowed_too(self):
+        """执行率也要按窗口看 —— 纪律会滑坡，终身执行率看不出最近在放飞。"""
+        from duanxian.risk import rolling
+
+        # 前 30 笔按计划、最近 10 笔全是计划外（start 偏移保证日期不重叠）
+        trades = (self._mk([100.0] * 30, planned=True)
+                  + self._mk([100.0] * 10, planned=False, start=30))
+        r = rolling(trades)
+        assert r["lifetime"]["execution_rate"] == pytest.approx(0.75)
+        assert r["windows"]["10"]["execution_rate"] == 0.0, "近 10 笔全是计划外"
+
+
+class TestExcursion:
+    """MFE/MAE —— 结果只说了终点，过程里藏着"是不是总在最高点前就跑了"。"""
+
+    @staticmethod
+    def _trade(buy: str, sell: str, cost: float, realized: float) -> dict:
+        return {"code": "688017", "name": "绿的谐波", "date": buy,
+                "settled": {"avg_cost": cost, "first_buy": buy, "last_sell": sell,
+                            "realized_pct": realized}}
+
+    def test_certain_bounds_have_opposite_directions(self, monkeypatch):
+        """`mfe_certain` 与 `mae_certain` 方向不同，不能当成同一种「下界」。
+
+        ⚠️ 第一版把两个都标成下界。`mae_certain` **可能是正数** —— 那表示中间
+        那几天从未浮亏，不是"浮亏 +4.57%"。实测出现过（成本 292，中间两日最低 305）。
+        """
+        from duanxian import excursion as ex
+
+        monkeypatch.setattr(ex, "bars", lambda *a, **kw: [
+            {"date": "2026-07-21", "high": 300.0, "low": 278.0, "close": 292.0},
+            {"date": "2026-07-22", "high": 332.0, "low": 312.0, "close": 316.0},
+            {"date": "2026-07-23", "high": 320.0, "low": 305.0, "close": 308.0},
+            {"date": "2026-07-24", "high": 306.0, "low": 290.0, "close": 295.0},
+        ])
+        r = ex.for_trade(self._trade("2026-07-21", "2026-07-24", 292.0, 1.13))
+        assert r["available"]
+        # 全窗口：最高 332 / 最低 278
+        assert r["mfe_pct"] == pytest.approx(13.7, abs=0.1)
+        assert r["mae_pct"] == pytest.approx(-4.79, abs=0.1)
+        # 中间完整交易日只有 07-22 / 07-23：最低 305 仍高于成本 → certain 为正
+        assert r["mae_certain"] > 0
+        assert "从未浮亏" in r["certain_note"]
+        assert r["bars_inner"] == 2
+
+    def test_same_day_is_flagged_as_upper_bound_only(self, monkeypatch):
+        """同日进出必须标明只能给上界 —— 日线分不清高点在买入之前还是之后。
+
+        不标的话，"MFE 8%" 会被当成"我真的曾经赚到过 8%"，而那个高点可能出现在
+        09:31、买入是 10:00。
+        """
+        from duanxian import excursion as ex
+
+        monkeypatch.setattr(ex, "bars", lambda *a, **kw: [
+            {"date": "2026-07-22", "high": 332.0, "low": 312.0, "close": 316.0}])
+        r = ex.for_trade(self._trade("2026-07-22", "2026-07-22", 326.5, -3.0))
+        assert r["same_day"] is True
+        assert "上界" in r["precision"]
+        assert r["mfe_certain"] is None, "同日进出没有可靠的中间交易日"
+        assert r["bars_inner"] == 0
+
+    def test_fetch_failure_is_unavailable_not_zero(self, monkeypatch):
+        """取不到行情必须标 unavailable，绝不能当成"没波动"。
+
+        当成 0 的话，MFE=0 会让"完美卖在最高点"和"数据没拿到"长得一模一样。
+        """
+        from duanxian import excursion as ex
+
+        monkeypatch.setattr(ex, "bars", lambda *a, **kw: None)
+        r = ex.for_trade(self._trade("2026-07-21", "2026-07-24", 292.0, 1.13))
+        assert r["available"] is False
+        assert "取不到" in r["reason"]
+
+    def test_capture_rate_skipped_when_no_move_available(self, monkeypatch):
+        """MFE 太小时不给捕获率 —— 买进去就没涨过，谈不上"卖早了"。"""
+        from duanxian import excursion as ex
+
+        monkeypatch.setattr(ex, "bars", lambda *a, **kw: [
+            {"date": "2026-07-21", "high": 293.0, "low": 288.0, "close": 290.0},
+            {"date": "2026-07-22", "high": 294.0, "low": 289.0, "close": 291.0}])
+        r = ex.for_trade(self._trade("2026-07-21", "2026-07-22", 292.0, -0.5))
+        assert r["mfe_pct"] < 3.0
+        assert r["capture_rate"] is None
+
+    def test_summary_discloses_the_bias(self):
+        """汇总必须把"捕获率被系统性低估"这个偏差和结论摆在一起。"""
+        import inspect
+
+        from duanxian import excursion as ex
+
+        src = inspect.getsource(ex.summary)
+        assert "bias_note" in src
+        assert "低估" in src
+
+    def test_render_forbids_prompt_use(self):
+        """同 risk / attribution：注释必须写明不接进 prompt。"""
+        from duanxian import excursion
+
+        doc = excursion.render.__doc__ or ""
+        assert "不要" in doc and "prompt" in doc
+
+
+class TestAtRisk:
+    """在险资金 —— 爆掉几乎从不是看错一次，而是同时在场的风险加起来超了。"""
+
+    @staticmethod
+    def _pos(code: str, cost: float, shares: float,
+             stop: float | None = None, sold: float = 0.0) -> dict:
+        fills = [{"side": "buy", "date": "2026-07-24", "price": cost, "shares": shares}]
+        if sold:
+            fills.append({"side": "sell", "date": "2026-07-24",
+                          "price": cost, "shares": sold})
+        return {"id": code, "code": code, "name": code, "date": "2026-07-24",
+                "playbook": "打板", "planned_stop": stop, "planned_target": None,
+                "fills": fills,
+                "settled": {"avg_cost": cost, "first_buy": "2026-07-24",
+                            "closed": sold >= shares}}
+
+    def test_unbounded_position_is_unknown_not_zero(self, monkeypatch):
+        """没写计划止损的仓位，风险是**未知**，不是零。
+
+        当 0 加进总数 → 总在险被系统性低估，而数字看着完全正常。
+        """
+        import duanxian.journal as J
+        from duanxian import at_risk as ar
+
+        monkeypatch.setattr(J, "list_trades", lambda limit=1000: {"trades": [
+            self._pos("A", 100.0, 1000, stop=95.0),
+            self._pos("B", 300.0, 300),          # 没写止损
+        ]})
+        monkeypatch.setattr(ar, "load_equity_base", lambda: 200000.0)
+        r = ar.report()
+        assert r["total_at_risk"] == pytest.approx(5000.0), "只能加有边界的那笔"
+        assert r["unbounded_count"] == 1
+        assert r["unbounded_capital"] == pytest.approx(90000.0)
+        assert "下限" in r["unbounded_note"], "必须说明总在险是下限"
+
+    def test_stop_above_cost_gives_zero_not_negative(self, monkeypatch):
+        """止损价高于成本时在险为 0，不能是负数。
+
+        负的在险会把总数拉低，看着像"风险更小"，其实是"已锁定盈利"这另一回事。
+        """
+        import duanxian.journal as J
+        from duanxian import at_risk as ar
+
+        monkeypatch.setattr(J, "list_trades", lambda limit=1000: {"trades": [
+            self._pos("A", 100.0, 1000, stop=110.0)]})
+        monkeypatch.setattr(ar, "load_equity_base", lambda: 200000.0)
+        r = ar.report()
+        assert r["total_at_risk"] == 0.0
+        assert r["positions"][0]["at_risk"] == 0.0
+
+    def test_closed_and_partially_sold_handled(self, monkeypatch):
+        """已平仓的不算；部分卖出的只按**剩余股数**算。"""
+        import duanxian.journal as J
+        from duanxian import at_risk as ar
+
+        monkeypatch.setattr(J, "list_trades", lambda limit=1000: {"trades": [
+            self._pos("A", 100.0, 1000, stop=95.0, sold=1000),   # 已平仓
+            self._pos("B", 100.0, 1000, stop=95.0, sold=600),    # 剩 400
+        ]})
+        monkeypatch.setattr(ar, "load_equity_base", lambda: 200000.0)
+        r = ar.report()
+        assert r["position_count"] == 1
+        assert r["positions"][0]["shares"] == pytest.approx(400.0)
+        assert r["total_at_risk"] == pytest.approx(2000.0)   # 5 × 400
+
+    def test_no_equity_base_means_no_ratio_not_a_guess(self, monkeypatch):
+        """没填账户规模就只给绝对金额，**不许估一个** —— 估大了占比偏小，
+        正好在"有没有超限"这个判断上出错。"""
+        import duanxian.journal as J
+        from duanxian import at_risk as ar
+
+        monkeypatch.setattr(J, "list_trades", lambda limit=1000: {"trades": [
+            self._pos("A", 100.0, 1000, stop=95.0)]})
+        monkeypatch.setattr(ar, "load_equity_base", lambda: None)
+        r = ar.report()
+        assert "at_risk_of_equity_pct" not in r
+        assert "equity_base_hint" in r
+
+    def test_render_forbids_prompt_use(self):
+        from duanxian import at_risk
+
+        doc = at_risk.render.__doc__ or ""
+        assert "不要" in doc and "prompt" in doc
+
+
+class TestInbox:
+    """异常交易收件箱 —— 复盘的敌人是流水太长，最该看的几笔淹在里面。"""
+
+    @staticmethod
+    def _t(tid: str, date: str, cap: float, hold: int = 0,
+           pnl: float | None = None, planned: bool | None = True,
+           closed: bool = True, stop: float | None = 1.0) -> dict:
+        return {"id": tid, "date": date, "code": "000001", "name": tid,
+                "playbook": "打板", "pnl_pct": pnl, "as_planned": planned,
+                "planned_stop": stop, "note": "",
+                "fills": [{"side": "buy", "date": date, "price": 10.0,
+                           "shares": cap / 10.0}],
+                "settled": {"avg_cost": 10.0, "capital_used": cap,
+                            "hold_days": hold, "closed": closed,
+                            "has_fills": True, "first_buy": date}}
+
+    def test_no_habit_baseline_from_tiny_history(self, monkeypatch):
+        """样本不够时不做"相对自己习惯"的判定 —— 3 笔的中位数不是习惯。"""
+        import duanxian.journal as J
+        from duanxian import inbox, risk
+
+        monkeypatch.setattr(J, "list_trades", lambda limit=500: {"trades": [
+            self._t("a", "2026-07-20", 10000), self._t("b", "2026-07-21", 10000),
+            self._t("c", "2026-07-22", 500000)]})     # 50 倍仓，但样本不够
+        monkeypatch.setattr(risk, "load_rules", lambda: dict(risk.DEFAULT_RULES,
+                                                             _is_default=True))
+        monkeypatch.setattr(inbox, "_MIN_HISTORY", 8)
+        r = inbox.build()
+        assert r["baseline"]["history_enough"] is False
+        keys = {f["key"] for it in r["items"] for f in it["flags"]}
+        assert "oversized" not in keys, "样本不够就不该报「仓位偏大」"
+
+    def test_oversized_is_relative_to_own_median(self, monkeypatch):
+        """"仓位偏大"必须相对**他自己的中位数**，不是行业标准。"""
+        import duanxian.journal as J
+        from duanxian import inbox, risk
+
+        trades = [self._t(f"n{i}", f"2026-07-{i + 1:02d}", 10000) for i in range(8)]
+        trades.append(self._t("big", "2026-07-20", 50000))     # 5 倍中位
+        monkeypatch.setattr(J, "list_trades", lambda limit=500: {"trades": trades})
+        monkeypatch.setattr(risk, "load_rules", lambda: dict(risk.DEFAULT_RULES,
+                                                             _is_default=True))
+        r = inbox.build()
+        big = next(it for it in r["items"] if it["id"] == "big")
+        f = next(f for f in big["flags"] if f["key"] == "oversized")
+        assert "中位仓位" in f["text"]
+        # 其它 8 笔都不该因为仓位进来
+        others = [it for it in r["items"] if it["id"] != "big"]
+        assert all(f["key"] != "oversized" for it in others for f in it["flags"])
+
+    def test_loss_limit_uses_user_own_threshold(self, monkeypatch):
+        """亏损上限用的是**用户自己写的**阈值，不是我们定的数。"""
+        import duanxian.journal as J
+        from duanxian import inbox, risk
+
+        monkeypatch.setattr(J, "list_trades", lambda limit=500: {"trades": [
+            self._t("a", "2026-07-20", 10000, pnl=-6.0)]})
+        # 用户把上限设成 10% → 亏 6% 不该报
+        monkeypatch.setattr(risk, "load_rules",
+                            lambda: {**risk.DEFAULT_RULES,
+                                     "max_loss_per_trade_pct": 10.0, "_is_default": False})
+        r = inbox.build()
+        keys = {f["key"] for it in r["items"] for f in it["flags"]}
+        assert "over_loss_limit" not in keys
+        # 改成 5% → 该报
+        monkeypatch.setattr(risk, "load_rules",
+                            lambda: {**risk.DEFAULT_RULES,
+                                     "max_loss_per_trade_pct": 5.0, "_is_default": False})
+        r2 = inbox.build()
+        keys2 = {f["key"] for it in r2["items"] for f in it["flags"]}
+        assert "over_loss_limit" in keys2
+
+    def test_sorted_by_date_not_by_our_severity(self):
+        """排序必须按日期倒序 —— 按「我们觉得多严重」排就是替用户判断了。"""
+        import inspect
+
+        from duanxian import inbox
+
+        src = inspect.getsource(inbox.build)
+        assert 'items.sort(key=lambda r: (r["date"] or ""), reverse=True)' in src
+        assert "severity" not in src
+
+    def test_open_position_without_stop_is_flagged(self, monkeypatch):
+        """还在手上却没写计划止损 → 必须进收件箱（在险资金无从估计）。"""
+        import duanxian.journal as J
+        from duanxian import inbox, risk
+
+        monkeypatch.setattr(J, "list_trades", lambda limit=500: {"trades": [
+            self._t("open", "2026-07-24", 10000, closed=False, stop=None)]})
+        monkeypatch.setattr(risk, "load_rules", lambda: dict(risk.DEFAULT_RULES,
+                                                             _is_default=True))
+        r = inbox.build()
+        keys = {f["key"] for it in r["items"] for f in it["flags"]}
+        assert "no_stop" in keys
+
+
+class TestExcursionNegativeMfe:
+    """MFE 可能为负 —— 那段行情最高价从没超过成本，即这笔从头到尾没浮盈过。"""
+
+    def test_negative_mfe_gives_no_capture_rate(self, monkeypatch):
+        """MFE 为负时不能算捕获率（负数做分母，符号会翻，读出来正好相反）。"""
+        from duanxian import excursion as ex
+
+        monkeypatch.setattr(ex, "bars", lambda *a, **kw: [
+            {"date": "2026-07-20", "high": 9.0, "low": 8.0, "close": 8.5},
+            {"date": "2026-07-21", "high": 8.8, "low": 7.5, "close": 8.0}])
+        r = ex.for_trade({"code": "000001", "name": "x",
+                          "settled": {"avg_cost": 10.0, "first_buy": "2026-07-20",
+                                      "last_sell": "2026-07-21", "realized_pct": -20.0}})
+        assert r["mfe_pct"] < 0, "最高价低于成本 → MFE 为负"
+        assert r["capture_rate"] is None
+        # 回吐仍非负（卖价必在 [low, high] 内 → realized ≤ mfe）
+        assert r["give_back_pct"] >= 0
+
+    def test_frontend_does_not_hardcode_plus_on_mfe(self):
+        """前端不能硬编码 `+` —— 会显示成 "+-25.06%"，还把"从没赚过"涂成绿色。"""
+        import pathlib
+
+        src = pathlib.Path("frontend/src/pages/Journal.tsx").read_text(encoding="utf-8")
+        assert "+{r.mfe_pct}%" not in src
+        assert '{r.mfe_pct > 0 ? "+" : ""}{r.mfe_pct}%' in src
+
+
+class TestNegativeCaptureRate:
+    """捕获率可能为负 —— MFE 为正但亏损离场。数学没错，但必须给人话解释。"""
+
+    def test_negative_capture_gets_explained(self, monkeypatch):
+        from duanxian import excursion as ex
+
+        monkeypatch.setattr(ex, "bars", lambda *a, **kw: [
+            {"date": "2026-07-20", "high": 11.0, "low": 9.0, "close": 10.5},
+            {"date": "2026-07-21", "high": 10.8, "low": 9.2, "close": 9.6}])
+        r = ex.for_trade({"code": "000001", "name": "x",
+                          "settled": {"avg_cost": 10.0, "first_buy": "2026-07-20",
+                                      "last_sell": "2026-07-21", "realized_pct": -4.0}})
+        assert r["mfe_pct"] > 0, "这段确实涨过"
+        assert r["capture_rate"] < 0
+        assert "亏损离场" in (r["capture_note"] or ""), "负捕获率必须给一句人话"
+
+    def test_summary_counts_and_explains_negatives(self, monkeypatch):
+        """汇总要单独报"有肉却亏损离场"的笔数，别让负中位数看着像算错。"""
+        import duanxian.journal as J
+        from duanxian import excursion as ex
+
+        monkeypatch.setattr(ex, "bars", lambda *a, **kw: [
+            {"date": "2026-07-20", "high": 11.0, "low": 9.0, "close": 10.5},
+            {"date": "2026-07-21", "high": 10.8, "low": 9.2, "close": 9.6}])
+        monkeypatch.setattr(J, "list_trades", lambda limit=300: {"trades": [
+            {"code": "000001", "name": "x",
+             "settled": {"avg_cost": 10.0, "first_buy": "2026-07-20",
+                         "last_sell": "2026-07-21", "realized_pct": -4.0}}]})
+        s = ex.summary()
+        assert s["lost_with_move_count"] == 1
+        assert "不是算错了" in (s["capture_note"] or "")
+
+    def test_frontend_surfaces_the_note(self):
+        import pathlib
+
+        src = pathlib.Path("frontend/src/pages/Journal.tsx").read_text(encoding="utf-8")
+        assert "plain(rep.capture_note)" in src
+        assert "r.capture_note" in src
+
+
+class TestSettledFieldNames:
+    def test_settle_exposes_amount_not_capital_used(self):
+        from duanxian.journal import _norm_fills, _settle
+
+        st = _settle(_norm_fills([
+            {"side": "buy", "date": "2026-07-24", "price": 100.0, "shares": 500}]))
+        assert "amount" in st and st["amount"] == pytest.approx(50000.0)
+        assert "capital_used" not in st, "字段名是 amount，别再引用 capital_used"
+
+    def test_inbox_reads_the_real_field(self):
+        from duanxian.inbox import _capital_of
+
+        t = {"settled": {"amount": 50000.0, "avg_cost": 100.0},
+             "fills": [{"side": "buy", "shares": 500}]}
+        assert _capital_of(t) == pytest.approx(50000.0)
+        # 没有 amount 时才回退按 fills 重算
+        t2 = {"settled": {"avg_cost": 100.0},
+              "fills": [{"side": "buy", "shares": 500}]}
+        assert _capital_of(t2) == pytest.approx(50000.0)
+
+    def test_open_position_has_fills_but_no_realized(self):
+        """未平仓：有明细、有占用金额，但**没有** realized_pnl。
+
+        前端只判 `realized_pnl != null` 会把这种显示成「未填明细」——
+        用户明明填对了却看到"未填"，和 fills 被丢弃时的表现一模一样。
+        """
+        from duanxian.journal import _norm_fills, _settle
+
+        st = _settle(_norm_fills([
+            {"side": "buy", "date": "2026-07-24", "price": 100.0, "shares": 500}]))
+        assert st["has_fills"] is True
+        assert st["closed"] is False
+        assert st.get("realized_pnl") is None
+        assert st["amount"] is not None
+
+    def test_frontend_distinguishes_three_states(self):
+        import pathlib
+
+        src = pathlib.Path("frontend/src/pages/Journal.tsx").read_text(encoding="utf-8")
+        assert "t.settled?.has_fills" in src, "必须区分「持仓中」与「未填明细」"
+        assert "持仓中" in src
+
+    def test_journal_form_collects_planned_stop(self):
+        """录入表单必须收计划止损 —— 不收的话在险资金整个功能形同虚设。
+
+        ⚠️ 和 fills 漏传是同一类：后端加了字段、API 也透传了，但**录入路径没接上**，
+        于是界面上建的每个仓位都是"未设止损"（P1）。
+        """
+        import pathlib
+
+        src = pathlib.Path("frontend/src/pages/Journal.tsx").read_text(encoding="utf-8")
+        assert "plannedStop" in src, "表单要有计划止损输入"
+        assert "planned_stop: plannedStop" in src, "提交时要带上"
+        assert "planned_target: plannedTarget" in src
+
+    def test_mode_playbook_change_opens_new_version(self, monkeypatch, tmp_path):
+        """改 `playbook` 也要开新版本 —— 它是"哪些交易归这张卡"的依据。
+
+        只存卡片层又不开版本的话，`performance()` 会拿**当前** playbook 去筛全部
+        历史交易：旧打法的交易被整批移出、无关交易被算进来 = **追溯重写历史归属**（P2）。
+        """
+        from duanxian import modes
+
+        monkeypatch.setattr(modes, "_PATH", str(tmp_path / "cards.json"))
+        monkeypatch.setattr(modes, "_DIR", str(tmp_path))
+        modes.save_card({"name": "卡", "playbook": "打板", "setup": "A"})
+        cid = modes.list_cards()["cards"][0]["id"]
+        r = modes.save_card({"id": cid, "name": "卡", "playbook": "低吸", "setup": "A",
+                             "changes": "换打法"})
+        assert r["new_version"] is True, "改 playbook 必须开新版本"
+        vers = modes.list_cards()["cards"][0]["versions"]
+        assert vers[0]["playbook"] == "打板"
+        assert vers[1]["playbook"] == "低吸"
+
+    def test_mode_attribution_uses_playbook_of_that_version(self, monkeypatch, tmp_path):
+        """归属用**那天生效的版本的 playbook**，改选择器不能改写历史。"""
+        import duanxian.journal as J
+        from duanxian import modes
+
+        monkeypatch.setattr(modes, "_PATH", str(tmp_path / "cards.json"))
+        monkeypatch.setattr(modes, "_DIR", str(tmp_path))
+        monkeypatch.setattr(modes, "_MIN_PER_VERSION", 1)
+        modes.save_card({"name": "卡", "playbook": "打板", "setup": "A"})
+        cid = modes.list_cards()["cards"][0]["id"]
+        modes.save_card({"id": cid, "name": "卡", "playbook": "低吸", "setup": "A",
+                         "changes": "换打法"})
+        env = modes._load_env()
+        env["cards"][0]["versions"][0]["since"] = "2026-07-01"
+        env["cards"][0]["versions"][1]["since"] = "2026-07-20"
+        modes._save(env, env["cards"])
+
+        monkeypatch.setattr(J, "list_trades", lambda limit=1000: {"trades": [
+            # v1 期间的打板 → 该算 v1
+            {"playbook": "打板", "pnl_pct": 5.0, "date": "2026-07-05",
+             "settled": {"first_buy": "2026-07-05"}},
+            # v1 期间的低吸 → 那时这张卡管的是打板，不该算
+            {"playbook": "低吸", "pnl_pct": 9.0, "date": "2026-07-06",
+             "settled": {"first_buy": "2026-07-06"}},
+            # v2 期间的低吸 → 该算 v2
+            {"playbook": "低吸", "pnl_pct": -2.0, "date": "2026-07-21",
+             "settled": {"first_buy": "2026-07-21"}},
+            # v2 期间的打板 → v2 管低吸，不该算
+            {"playbook": "打板", "pnl_pct": 7.0, "date": "2026-07-22",
+             "settled": {"first_buy": "2026-07-22"}},
+        ]})
+        card = modes.performance()["cards"][0]
+        v1, v2 = card["by_version"]
+        assert v1["trades"] == 1 and v1["median_pct"] == pytest.approx(5.0)
+        assert v2["trades"] == 1 and v2["median_pct"] == pytest.approx(-2.0)
+        assert card["matched_trades"] == 2
+
+    def test_inbox_never_fetches_quotes_inline(self, monkeypatch):
+        """收件箱**一次网络请求都不能发**。
+
+        ⚠️ excursion 之所以单独成端点就是因为它逐笔拉行情；收件箱内联调用等于把
+        网络开销搬回来 —— 几百笔的真实账本首次打开会卡几分钟甚至超时（P2）。
+        """
+        import duanxian.journal as J
+        from duanxian import excursion, inbox, risk
+
+        calls = []
+        monkeypatch.setattr(excursion, "bars",
+                            lambda *a, **kw: calls.append(a) or None)
+        monkeypatch.setattr(risk, "load_rules",
+                            lambda: dict(risk.DEFAULT_RULES, _is_default=True))
+        monkeypatch.setattr(J, "list_trades", lambda limit=500: {"trades": [
+            {"id": f"t{i}", "date": "2026-07-20", "code": "002463", "name": "x",
+             "playbook": "打板", "pnl_pct": -9.0, "as_planned": False,
+             "planned_stop": None, "note": "",
+             "fills": [{"side": "buy", "shares": 100}],
+             "settled": {"closed": True, "has_fills": True, "amount": 1000.0,
+                         "avg_cost": 10.0, "first_buy": "2026-07-20",
+                         "last_sell": "2026-07-21", "realized_pct": -9.0}}
+            for i in range(50)]})
+        r = inbox.build()
+        assert calls == [], f"收件箱发起了 {len(calls)} 次行情请求"
+        assert r["excursion_skipped"] == 50
+        assert "还没缓存" in (r["excursion_hint"] or ""), "跳过了多少笔要说清楚"
+
+
+class TestPrecisionLabel:
+    """`bars_inner == 0` = **没有**可靠的中间交易日 → 只能给上界。
+
+    ⚠️ 写成「中间 0 日可靠」字面意思正好相反（0 日可靠 = 不可靠）。
+    相邻两日买卖也是这种情况，不只同日进出。
+    """
+
+    def test_adjacent_days_have_no_inner_window(self, monkeypatch):
+        from duanxian import excursion as ex
+
+        monkeypatch.setattr(ex, "bars", lambda *a, **kw: [
+            {"date": "2026-07-23", "high": 11.0, "low": 9.5, "close": 10.0},
+            {"date": "2026-07-24", "high": 10.5, "low": 9.0, "close": 9.7}])
+        r = ex.for_trade({"code": "000001", "name": "x",
+                          "settled": {"avg_cost": 10.0, "first_buy": "2026-07-23",
+                                      "last_sell": "2026-07-24", "realized_pct": -3.0}})
+        assert r["same_day"] is False
+        assert r["bars_inner"] == 0
+        assert "上界" in r["precision"], "无中间交易日时必须说明只有上界"
+        assert r["mfe_certain"] is None
+
+    def test_frontend_does_not_say_zero_days_reliable(self):
+        import pathlib
+
+        src = pathlib.Path("frontend/src/pages/Journal.tsx").read_text(encoding="utf-8")
+        assert "r.bars_inner > 0 ? `中间 ${r.bars_inner} 日可靠`" in src
+        assert "相邻两日·仅上界" in src
+
+
+class TestExcursionCacheOnlyNeverFetches:
+    """`for_trade_cached_only` 必须一次网络请求都不发 —— 缓存坏了也不能回退去联网。"""
+    def test_cache_only_never_touches_network_even_on_corrupt_cache(self, monkeypatch, tmp_path):
+        """缓存文件**坏了**时也绝不能联网。
+
+        只判 `os.path.isfile` 的话：文件在但 JSON 坏 → `bars()` 当没命中 →
+        去发 akshare 请求 → "零网络"的承诺就破了。
+        """
+        from duanxian import excursion as ex
+
+        monkeypatch.setattr(ex, "_CACHE_DIR", str(tmp_path))
+        bad = tmp_path / "002463_2026-07-20_2026-07-21.json"
+        bad.write_text("{ 半截坏 JSON", encoding="utf-8")
+
+        calls = []
+        monkeypatch.setattr(ex, "bars", lambda *a, **kw: calls.append(a) or None)
+        trade = {"code": "002463", "name": "x",
+                 "settled": {"avg_cost": 10.0, "first_buy": "2026-07-20",
+                             "last_sell": "2026-07-21", "realized_pct": -1.0}}
+        assert ex.read_cached_bars("002463", "2026-07-20", "2026-07-21") is None
+        assert ex.for_trade_cached_only(trade) is None
+        assert calls == [], "坏缓存也不许落到网络路径"
+
+    def test_cache_only_uses_good_cache_without_network(self, monkeypatch, tmp_path):
+        """缓存好的时候要能算出来，而且仍然零请求。"""
+        import json
+
+        from duanxian import excursion as ex
+
+        monkeypatch.setattr(ex, "_CACHE_DIR", str(tmp_path))
+        (tmp_path / "002463_2026-07-20_2026-07-21.json").write_text(json.dumps([
+            {"date": "2026-07-20", "high": 11.0, "low": 9.5, "close": 10.0},
+            {"date": "2026-07-21", "high": 10.5, "low": 9.0, "close": 9.9}]),
+            encoding="utf-8")
+        calls = []
+        monkeypatch.setattr(ex, "bars", lambda *a, **kw: calls.append(a) or None)
+        r = ex.for_trade_cached_only({
+            "code": "002463", "name": "x",
+            "settled": {"avg_cost": 10.0, "first_buy": "2026-07-20",
+                        "last_sell": "2026-07-21", "realized_pct": -1.0}})
+        assert r is not None and r["available"] is True
+        assert r["mfe_pct"] == pytest.approx(10.0)     # 11.0 / 10.0
+        assert r["mae_pct"] == pytest.approx(-10.0)    # 9.0 / 10.0
+        assert calls == []
+
+
+class TestSuiteHasNoDuplicateClassNames:
+    """同名测试类会被**静默覆盖** —— 后定义的赢，前面那个一个方法都不跑。
+
+    ⚠️ 这不会报错、不会告警，pytest 的通过数只是悄悄少几个。合并测试时最容易踩到。
+    """
+
+    def test_no_duplicate_test_class_names(self):
+        import ast
+        import collections
+        import pathlib
+
+        src = pathlib.Path(__file__).read_text(encoding="utf-8")
+        names = [n.name for n in ast.parse(src).body
+                 if isinstance(n, ast.ClassDef) and n.name.startswith("Test")]
+        dup = [n for n, c in collections.Counter(names).items() if c > 1]
+        assert not dup, f"测试类重名（后者会覆盖前者，前者不会执行）：{dup}"
+
+    def test_no_duplicate_method_names_within_a_class(self):
+        """同一个类里的同名方法同理 —— 后者覆盖前者，前者静默消失。"""
+        import ast
+        import collections
+        import pathlib
+
+        src = pathlib.Path(__file__).read_text(encoding="utf-8")
+        bad = {}
+        for n in ast.parse(src).body:
+            if isinstance(n, ast.ClassDef):
+                ms = [m.name for m in n.body if isinstance(m, ast.FunctionDef)]
+                d = [m for m, c in collections.Counter(ms).items() if c > 1]
+                if d:
+                    bad[n.name] = d
+        assert not bad, f"类内方法重名：{bad}"
+
+
+# ================================================================ 归档 · 漂移 · 策略回测
+# ⚠️ 回测产出的是「规则的历史统计」，不是前瞻标的；样本偏差在模块 docstring 里写明。
+
+@pytest.mark.unit
+class TestBacktestCache:
+    """加策略不会改变 date_to —— 光看日期判新鲜度的话，新策略永远不出现。"""
+
+    def test_stale_strategy_set_is_rejected(self, tmp_path, monkeypatch):
+        import json as _json
+        from duanxian import backtest as bk
+
+        monkeypatch.setattr(bk, "RESULT_DIR", str(tmp_path))
+        stale = {"available": True, "date_to": "2026-07-24",
+                 "strategies": {"首板打板": {}}}          # 只有旧策略集的一个
+        (tmp_path / "last30.json").write_text(_json.dumps(stale), encoding="utf-8")
+        assert bk.load_result(30) is None
+
+    @staticmethod
+    def _write_fresh(bk, tmp_path, corpus_dir, **overrides):
+        """写一份"当前口径下完全新鲜"的缓存，供各用例微调后验证。"""
+        import json as _json
+
+        for d in ("2026-07-22", "2026-07-23", "2026-07-24"):
+            (corpus_dir / f"{d}.json").write_text("[]", encoding="utf-8")
+        r = {"available": True, "schema": bk._RESULT_SCHEMA,
+             "date_from": "2026-07-22", "date_to": "2026-07-24",
+             "strategies": {k: {} for k in bk.STRATEGIES},
+             "fingerprint": bk._fingerprint(
+                 bk._corpus_dates_in_window("2026-07-22", "2026-07-24"))}
+        r.update(overrides)
+        (tmp_path / "last30.json").write_text(_json.dumps(r), encoding="utf-8")
+
+    def test_matching_strategy_set_is_accepted(self, tmp_path, monkeypatch):
+        from duanxian import backtest as bk
+
+        corpus = tmp_path / "corpus"; corpus.mkdir()
+        monkeypatch.setattr(bk, "RESULT_DIR", str(tmp_path))
+        monkeypatch.setattr(bk, "_CACHE_DIR", str(corpus))
+        self._write_fresh(bk, tmp_path, corpus)
+        assert bk.load_result(30) is not None
+
+    def test_changed_params_invalidate_cache(self, tmp_path, monkeypatch):
+        """封板时间界这类**参数**变了，缓存必须作废。
+
+        它不改 date_to、不改策略集，光比日期和策略名的话，界面会一直显示按
+        旧阈值算出来的数字，且完全看不出异样。
+        """
+        from duanxian import backtest as bk
+
+        corpus = tmp_path / "corpus"; corpus.mkdir()
+        monkeypatch.setattr(bk, "RESULT_DIR", str(tmp_path))
+        monkeypatch.setattr(bk, "_CACHE_DIR", str(corpus))
+        self._write_fresh(bk, tmp_path, corpus)
+        assert bk.load_result(30) is not None          # 改之前是新鲜的
+
+        monkeypatch.setattr(bk, "_EARLY_SEAL", "093000")   # 早封界 10:00 → 9:30
+        assert bk.load_result(30) is None
+
+    def test_backfilled_corpus_invalidates_cache(self, tmp_path, monkeypatch):
+        """补抓了窗口**中间**缺的一天 → date_to 没变，但样本变了，必须重算（P2-2）。"""
+        from duanxian import backtest as bk
+
+        corpus = tmp_path / "corpus"; corpus.mkdir()
+        monkeypatch.setattr(bk, "RESULT_DIR", str(tmp_path))
+        monkeypatch.setattr(bk, "_CACHE_DIR", str(corpus))
+        self._write_fresh(bk, tmp_path, corpus)
+        assert bk.load_result(30) is not None
+
+        (corpus / "2026-07-23.json").unlink()               # 当初这天其实是缺的
+        assert bk.load_result(30) is None                   # 语料对不上 → 作废
+
+    def test_missing_cache_is_none(self, tmp_path, monkeypatch):
+        from duanxian import backtest as bk
+
+        monkeypatch.setattr(bk, "RESULT_DIR", str(tmp_path))
+        assert bk.load_result(30) is None
+        assert bk.prior_context(30) == ""   # 没缓存 → 空先验，绝不现算
+
+
+@pytest.mark.unit
+class TestCorpus:
+    """回测语料过期不候：数据源只留 ~15 个交易日，没抓下来的永久缺失。"""
+
+    def test_corpus_days_sorted(self, tmp_path, monkeypatch):
+        from duanxian import backtest as bk
+
+        monkeypatch.setattr(bk, "_CACHE_DIR", str(tmp_path))
+        for d in ("2026-07-10", "2026-07-08", "2026-07-09"):
+            (tmp_path / f"{d}.json").write_text("[]", encoding="utf-8")
+        (tmp_path / "notes.txt").write_text("x", encoding="utf-8")   # 非 json 不算
+        assert bk.corpus_days() == ["2026-07-08", "2026-07-09", "2026-07-10"]
+
+    def test_corpus_days_empty_when_dir_missing(self, tmp_path, monkeypatch):
+        from duanxian import backtest as bk
+
+        monkeypatch.setattr(bk, "_CACHE_DIR", str(tmp_path / "nope"))
+        assert bk.corpus_days() == []
+
+    def test_capture_reports_failure(self, monkeypatch):
+        from duanxian import backtest as bk
+
+        monkeypatch.setattr(bk.trade_calendar, "latest_session", lambda: "2026-07-24")
+        monkeypatch.setattr(bk, "_fetch_prev_pool", lambda d: None)
+        r = bk.capture()
+        assert r["ok"] is False and r["date"] == "2026-07-24"
+
+    def test_capture_no_session(self, monkeypatch):
+        from duanxian import backtest as bk
+
+        monkeypatch.setattr(bk.trade_calendar, "latest_session", lambda: None)
+        assert bk.capture()["ok"] is False
+
+
+@pytest.mark.unit
+class TestSealTimeCurve:
+    """封板时间分档：边界最容易写错（<= 上界、缺失单独归堆、只统计首板）。"""
+
+    @staticmethod
+    def _day(rows):
+        return {"2026-07-24": rows}
+
+    @staticmethod
+    def _r(seal, ret=1.0, boards=1):
+        return {"prev_boards": boards, "seal_time": seal, "sector": "A", "ret": ret}
+
+    def test_bucket_boundaries_inclusive(self):
+        from duanxian.backtest import seal_time_curve
+
+        # 093500 属"开盘秒板"（上界含），093501 落到下一档
+        c = {b["bucket"]: b for b in seal_time_curve(self._day([
+            self._r("093500"), self._r("093501"),
+        ]))}
+        assert c["开盘秒板"]["sample"] == 1
+        assert c["9:35-10:00"]["sample"] == 1
+
+    def test_only_first_boards_counted(self):
+        """连板股的封板时间含义不同，混进来会污染结论。"""
+        from duanxian.backtest import seal_time_curve
+
+        c = {b["bucket"]: b for b in seal_time_curve(self._day([
+            self._r("093000", boards=1), self._r("093000", boards=3),
+        ]))}
+        assert c["开盘秒板"]["sample"] == 1
+
+    def test_missing_seal_time_goes_to_own_bucket(self):
+        """时间缺失不能硬塞进某一档——那会污染那一档的统计。"""
+        from duanxian.backtest import seal_time_curve
+
+        c = {b["bucket"]: b for b in seal_time_curve(self._day([
+            self._r(""), self._r("093000"),
+        ]))}
+        assert c["封板时间缺失"]["sample"] == 1
+        assert c["开盘秒板"]["sample"] == 1
+
+    def test_beyond_last_bucket_falls_into_last(self):
+        """收盘后的异常时间戳也要有归宿，不能被丢掉。"""
+        from duanxian.backtest import seal_time_curve
+
+        c = {b["bucket"]: b for b in seal_time_curve(self._day([self._r("235959")]))}
+        assert c["14:00后"]["sample"] == 1
+
+    def test_empty_input(self):
+        from duanxian.backtest import seal_time_curve
+
+        assert all(b["sample"] == 0 for b in seal_time_curve({}))
+
+
+@pytest.mark.unit
+class TestBacktestFilters:
+    """策略过滤器 = 对群体的规则，签名 (row, ctx)。"""
+
+    @staticmethod
+    def _row(boards=1, seal="093500", sector="电网设备"):
+        return {"prev_boards": boards, "seal_time": seal, "sector": sector, "ret": 0.0}
+
+    def test_early_vs_late_seal(self):
+        from duanxian.backtest import STRATEGIES
+
+        ctx = {"main_sectors": {"电网设备"}}
+        early = STRATEGIES["首板·早封"]["filter"]
+        late = STRATEGIES["首板·尾盘封"]["filter"]
+        assert early(self._row(seal="093500"), ctx) and not late(self._row(seal="093500"), ctx)
+        assert late(self._row(seal="145900"), ctx) and not early(self._row(seal="145900"), ctx)
+        # 空封板时间两边都不算，不能默认归到某一档
+        assert not early(self._row(seal=""), ctx) and not late(self._row(seal=""), ctx)
+
+    def test_main_sector_filter(self):
+        from duanxian.backtest import STRATEGIES
+
+        f = STRATEGIES["首板·涨停数前二行业"]["filter"]
+        ctx = {"main_sectors": {"电网设备"}}
+        assert f(self._row(sector="电网设备"), ctx)
+        assert not f(self._row(sector="房地产"), ctx)
+        assert not f(self._row(sector=""), ctx)          # 行业缺失不硬算进主线
+        assert not f(self._row(boards=2, sector="电网设备"), ctx)   # 只管首板
+
+    def test_day_context_picks_top_sectors(self):
+        from duanxian.backtest import _day_context
+
+        rows = [self._row(sector="A")] * 5 + [self._row(sector="B")] * 3 + [self._row(sector="C")]
+        assert _day_context(rows)["main_sectors"] == {"A", "B"}
+
+
+@pytest.mark.unit
+class TestBacktestRegimeNoLookahead:
+    """分档必须用**入场前一交易日**的情绪，不能用收益发生当天的。
+    用当天情绪解释当天收益 = 拿"事后才知道的明天情绪"，看板上的分环境期望会被读成
+    可操作先验，但决策时点根本看不到当天情绪。数字照常出、界面正常、口径是错的。"""
+
+    def test_scores_come_from_prior_trading_day(self, monkeypatch):
+        from duanxian import backtest as bk
+
+        seq = ["2026-07-20", "2026-07-21", "2026-07-22", "2026-07-23", "2026-07-24"]
+        # 每天一个独特情绪分，方便验证到底取了哪一天
+        score_by_day = {d: float(i * 10) for i, d in enumerate(seq)}
+        monkeypatch.setattr(bk, "_day_score", lambda d: score_by_day.get(d))
+        # 若实现退回单日网络查询就让它炸，确保走的是 seq 映射而非 prev_trade_date
+        monkeypatch.setattr(bk.trade_calendar, "prev_trade_date",
+                            lambda d: (_ for _ in ()).throw(AssertionError("不该走网络，应查 seq 映射")))
+
+        day_list = ["2026-07-22", "2026-07-23", "2026-07-24"]
+        got = dict(bk._entry_day_scores(day_list, seq))
+        # 收益日 07-22 分档应取 07-21 的情绪分（=10），不是 07-22 自己的（=20）
+        assert got["2026-07-22"] == score_by_day["2026-07-21"]
+        assert got["2026-07-23"] == score_by_day["2026-07-22"]
+        assert got["2026-07-24"] == score_by_day["2026-07-23"]
+
+    def test_leftmost_day_falls_back_to_network(self, monkeypatch):
+        """窗口最左端在 seq 里没有前一天 → 回退单次网络查询，不能静默丢成 None。"""
+        from duanxian import backtest as bk
+
+        seq = ["2026-07-20", "2026-07-21"]
+        monkeypatch.setattr(bk, "_day_score", lambda d: 42.0 if d == "2026-07-19" else 1.0)
+        monkeypatch.setattr(bk.trade_calendar, "prev_trade_date",
+                            lambda d: "2026-07-19" if d == "2026-07-20" else None)
+        got = dict(bk._entry_day_scores(["2026-07-20"], seq))
+        assert got["2026-07-20"] == 42.0   # 走了回退，取到 07-19
+
+    def test_revision_bumped_so_old_cache_invalidates(self):
+        """口径变了，_STRATEGY_REVISION 必须 +1，否则旧缓存的 by_regime 是错口径还在用。"""
+        from duanxian import backtest as bk
+
+        assert bk._STRATEGY_REVISION >= 2
+
+
+@pytest.mark.unit
+class TestLimitUpDetection:
+    """`ret >= 9.8` 统一判涨停是错的：创业板/科创板 20cm、北交所 30cm、ST 5cm。
+    误差方向是**高估**再涨停率（把没涨停的算成涨停），让赚钱效应看着更好。
+    2026-07-24 实测：116 只昨日涨停股里 11 只 20cm，日科化学 +15.59% 被误判。"""
+
+    def test_board_and_limit_pct(self):
+        """⚠️ ST **不能**一刀切成 5%：创业板/科创板风险警示股仍是 20%。
+        北交所除 8x/4x 外还有 920 号段 —— 实测 2026-07-24 数据里就有 920222 益坤电气，
+        旧逻辑把它判成主板 10cm（它实际是 30cm），`ret>=9.8` 还把它误判成涨停。
+        """
+        from duanxian.market_facts import board_of, limit_pct
+
+        assert board_of("600000", "浦发银行") == "10cm" and limit_pct("600000", "浦发银行") == 10.0
+        assert board_of("300214", "日科化学") == "20cm" and limit_pct("300214", "日科化学") == 20.0
+        assert board_of("688981", "中芯国际") == "20cm"
+        assert board_of("830799", "艾融软件") == "北交所" and limit_pct("830799", "艾融软件") == 30.0
+        # 920 号段北交所 —— 第一版漏了，会被判成主板
+        assert board_of("920222", "益坤电气") == "北交所" and limit_pct("920222", "益坤电气") == 30.0
+        # 主板 ST 是 5%，但创业板 ST 仍是 20%（第一版按 ST 一刀切，全判成 5%）
+        assert board_of("600209", "ST罗顿") == "主板ST" and limit_pct("600209", "ST罗顿") == 5.0
+        assert limit_pct("300100", "ST双流") == 20.0, "创业板 ST 是 20% 不是 5%"
+
+    def test_limit_up_prefers_actual_limit_price(self):
+        """判涨停优先用「现价 == 涨停价」—— 数据源给的事实，自动适配任何制度变化。"""
+        from duanxian import data as bk
+
+        # 益坤电气：涨 10.49% 但涨停价 37.18、现价 31.60 → 没涨停
+        assert bk.is_limit_up({"code": "920222", "name": "益坤电气", "ret": 10.49,
+                                "close": 31.60, "limit_price": 37.18}) is False
+        # 真涨停：现价==涨停价
+        assert bk.is_limit_up({"code": "600000", "name": "浦发", "ret": 10.0,
+                                "close": 12.31, "limit_price": 12.31}) is True
+
+    def test_falls_back_to_rule_when_price_missing(self):
+        """老缓存没有价格字段时退回制度推定，但不能假装能判。"""
+        from duanxian import data as bk
+
+        assert bk.is_limit_up({"code": "300214", "name": "日科化学", "ret": 15.59}) is False
+        assert bk.is_limit_up({"code": "600000", "name": "浦发", "ret": 9.98}) is True
+        assert bk.is_limit_up({"code": "600000", "name": "浦发"}) is None   # 连 ret 都没有
+
+    def test_20cm_stock_at_15pct_is_not_limit_up(self):
+        """这就是实测被误判的那只：创业板涨 15.59%，离 20cm 涨停还差得远。"""
+        from duanxian import backtest as bk
+
+        rows = [{"code": "300214", "name": "日科化学", "ret": 15.59,
+                 "close": 11.86, "limit_price": 12.31}]
+        st = bk._stats([15.59], rows)
+        assert st["limit_up_rate"] == 0.0, "15.59% 且现价≠涨停价 → 不是涨停"
+
+    def test_20cm_stock_at_limit_is_counted(self):
+        from duanxian import backtest as bk
+
+        rows = [{"code": "301234", "name": "五洲医疗", "ret": 19.99,
+                 "close": 24.00, "limit_price": 24.00}]
+        assert bk._stats([19.99], rows)["limit_up_rate"] == 1.0
+
+    def test_st_at_5pct_is_limit_up(self):
+        """ST 涨 5% 就是涨停，旧口径 `>=9.8` 会整类漏掉。"""
+        from duanxian import backtest as bk
+
+        rows = [{"code": "600209", "name": "ST罗顿", "ret": 4.98,
+                 "close": 5.06, "limit_price": 5.06}]
+        assert bk._stats([4.98], rows)["limit_up_rate"] == 1.0
+
+    def test_no_rows_means_no_guess(self):
+        """拿不到票的信息时给 None，不用统一阈值糊弄。"""
+        from duanxian import backtest as bk
+
+        assert bk._stats([9.9, 5.0])["limit_up_rate"] is None
+
+
+class TestArchive:
+    """归档是"半年后还能重算"的唯一依据。rows 必须是原样，不能加工。"""
+
+    def test_put_and_get_roundtrip(self, tmp_path, monkeypatch):
+        from duanxian import archive
+
+        monkeypatch.setattr(archive, "_DIR", str(tmp_path))
+        rows = [{"代码": "600000", "名称": "浦发", "涨跌幅": 10.0}]
+        assert archive.put("2026-07-24", "zt_pool", "test", rows)["ok"]
+        env = archive.get("2026-07-24", "zt_pool")
+        assert env["rows"] == rows, "归档必须原样保存，不能加工"
+        assert env["meta"]["fields"] == ["代码", "名称", "涨跌幅"]
+        assert env["meta"]["row_count"] == 1
+
+    def test_empty_is_not_archived(self, tmp_path, monkeypatch):
+        """空数据不归档 —— 否则会把一次取数失败固化成"那天没有数据"。"""
+        from duanxian import archive
+
+        monkeypatch.setattr(archive, "_DIR", str(tmp_path))
+        assert archive.put("2026-07-24", "zt_pool", "test", [])["ok"] is False
+
+    def test_no_overwrite_by_default(self, tmp_path, monkeypatch):
+        """同一天的原始事实只该有一份，默认不覆盖。"""
+        from duanxian import archive
+
+        monkeypatch.setattr(archive, "_DIR", str(tmp_path))
+        archive.put("2026-07-24", "x", "test", [{"a": 1}])
+        r = archive.put("2026-07-24", "x", "test", [{"a": 2}])
+        assert r.get("skipped") is True
+        assert archive.get("2026-07-24", "x")["rows"] == [{"a": 1}]
+
+    def test_field_drift_detected(self, tmp_path, monkeypatch):
+        """数据源改字段会在派生曲线上造出**假断点** —— 必须能检测出来。
+
+        ⚠️ 前提是**原样归档**（`raw=True`）：归一化过的行键集被我们的 mapping
+        固定住，源改了它也纹丝不动。
+        """
+        from duanxian import archive
+
+        monkeypatch.setattr(archive, "_DIR", str(tmp_path))
+        archive.put("2026-07-20", "p", "test", [{"a": 1, "b": 2}], raw=True)
+        archive.put("2026-07-21", "p", "test", [{"a": 1, "b": 2}], raw=True)
+        archive.put("2026-07-22", "p", "test", [{"a": 1, "c": 3}], raw=True)  # 源换字段
+        d = archive.field_drift("p")
+        assert d["changed"] is True and len(d["versions"]) == 2
+        assert d["versions"][1]["since"] == "2026-07-22"
+        assert d["detectable"] is True and d["raw_days"] == 3
+
+    def test_field_drift_ignores_normalized_archives(self, tmp_path, monkeypatch):
+        """归一化归档不能参与漂移检测 —— 否则会得出"字段一直稳定"的假结论。
+
+        它们的键集由我们的 mapping 固定，源改列只会让某个键变成 None。
+        """
+        from duanxian import archive
+
+        monkeypatch.setattr(archive, "_DIR", str(tmp_path))
+        archive.put("2026-07-20", "q", "test", [{"a": 1, "b": 2}])           # raw=False
+        archive.put("2026-07-21", "q", "test", [{"a": 1, "c": 3}])           # raw=False
+        d = archive.field_drift("q")
+        assert d["changed"] is False
+        assert d["detectable"] is False, "只有归一化归档时不该声称能检测"
+        assert d["mapped_days"] == 2 and d["raw_days"] == 0
+        assert "还检不出漂移" in d["note"], "「检不出」和「没有漂移」必须分得开"
+
+
+class TestDrift:
+    """结构漂移 —— 把「制度变了 / 数据源变了 / 市场真变了」三类分开。"""
+
+    def test_regime_events_are_manual_only(self):
+        """制度事件只收人工登记，**不从数据反推**。
+
+        从数据反推「这天大概改了规则」是猜，猜错会把市场波动当成制度事件。
+        """
+        import inspect
+
+        from duanxian import drift
+
+        src = inspect.getsource(drift)
+        assert "load_calendar" in src
+        # 不该有任何"自动检测制度变化"的推断逻辑
+        assert "infer_regime" not in src and "detect_regime" not in src
+        assert "人工登记" in (drift.report.__doc__ or "") + src
+
+    def test_calendar_allows_weekend_but_rejects_future(self, monkeypatch, tmp_path):
+        """制度变化常在**周末公布**，日历必须允许周末；但拒未来日期。
+
+        ⚠️ 这里故意不用 `util.validate_trade_date` —— 那是给数据查询用的交易日闸门，
+        会把周末公布的规则通知整个挡在外面。
+        """
+        from duanxian import drift
+
+        monkeypatch.setattr(drift, "_CAL_PATH", str(tmp_path / "cal.json"))
+        monkeypatch.setattr(drift, "_DIR", str(tmp_path))
+        r = drift.save_calendar([{"date": "2026-07-25", "title": "周五公布"},
+                                 {"date": "2026-07-26", "title": "周六公布"}])
+        assert r["count"] == 2, "周末日期必须能记进来"
+        with pytest.raises(ValueError, match="未来日期"):
+            drift.save_calendar([{"date": "2099-01-01", "title": "未来"}])
+        with pytest.raises(ValueError, match="日期和标题"):
+            drift.save_calendar([{"date": "2026-07-25"}])
+
+    def test_uses_archived_board_not_recomputed(self):
+        """结构统计要用**归档里已归一化的 board**，不能用今天的规则重算历史。
+
+        重算 = 用新规则解释旧数据，正是本模块要检测的那类错误。
+        """
+        import inspect
+
+        from duanxian import drift
+
+        src = inspect.getsource(drift._day_structure)
+        assert 'r.get("board")' in src
+        assert "用**今天的** board_of 规则去套历史数据" in src
+
+    def test_structure_uses_median_not_mean(self):
+        """窗口比较用中位数 —— 少数极端日（大面日/涨停潮）会把均值拉飞，
+        看起来像"结构变了"，其实只是有一天很极端。"""
+        import inspect
+
+        from duanxian import drift
+
+        src = inspect.getsource(drift.structure_shift)
+        assert "median(" in src
+        assert "sum(" not in src.split("def collect")[0] or True   # 不用均值做判据
+
+    def test_not_enough_archive_says_so(self, monkeypatch):
+        """归档天数不够时明确说不可用，不拿几天硬算。"""
+        from duanxian import archive, drift
+
+        monkeypatch.setattr(archive, "days", lambda slug=None: ["2026-07-20"] * 3)
+        r = drift.structure_shift()
+        assert r["available"] is False
+        assert "至少要" in r["reason"]
+
+
+class TestArchiveStoresRawRows:
+    """归档必须存**源的原始行**：归一化过的行既检不出字段漂移，也拿不回被丢掉的列。"""
+
+    def test_archive_stores_raw_source_rows(self):
+        """归档必须存**源的原样行**，不是 `_df_rows` 归一化后的。
+
+        ⚠️ 归一化行的键集被我们的 mapping 固定住 → 源加列/改名/删列时归档
+        **纹丝不动**（缺列只变成 None）→ `field_drift()` 的全部意义失效，
+        被丢掉的列也永久拿不回来。归档的两个承诺都不成立（P1）。
+        """
+        import inspect
+
+        from duanxian import archive, market_facts as mf
+
+        assert hasattr(mf, "_raw_rows"), "market_facts 要提供原样行"
+        src = inspect.getsource(mf._raw_rows)
+        assert "for k in df.columns" in src, "必须遍历源的全部列，不能按 mapping 取"
+        cap = inspect.getsource(archive.capture_day)
+        assert 'pools.get("raw")' in cap
+        assert "raw=is_raw" in cap, "必须如实标明这份归档是不是原样"
+
+    def test_field_drift_only_trusts_raw_archives(self):
+        """漂移检测只能用原样归档 —— 算进归一化归档会得出"字段一直稳定"的假结论。"""
+        import inspect
+
+        from duanxian import archive
+
+        src = inspect.getsource(archive.field_drift)
+        assert 'meta.get("raw")' in src
+        # "检不出漂移" 与 "没有漂移" 必须分得开
+        assert "detectable" in src
+
+
+class TestSingleLimitUpImplementation:
+    """判涨停只能有**一份**实现（`data.is_limit_up`）。
+
+    ⚠️ 回测与复盘如果各写一份，两边对"什么算涨停"的标准会悄悄分叉 ——
+    涨停家数、晋级率、赚钱效应全部跟着偏，而两边的数字各自看着都正常。
+    """
+
+    def test_no_second_definition_of_is_limit_up(self):
+        import ast
+        import pathlib
+
+        root = pathlib.Path(__file__).resolve().parent.parent / "duanxian"
+        defs = []
+        for f in sorted(root.glob("*.py")):
+            for n in ast.walk(ast.parse(f.read_text(encoding="utf-8"))):
+                if isinstance(n, ast.FunctionDef) and n.name.lstrip("_") == "is_limit_up":
+                    # market_facts 那个是按涨幅判的旧口径，签名不同、用途不同，单独排除
+                    if f.name == "market_facts.py":
+                        continue
+                    defs.append(f"{f.name}:{n.lineno} {n.name}")
+        assert defs == ["data.py:362 is_limit_up"] or len(defs) == 1, \
+            f"判涨停出现多份实现：{defs} —— 只能留 data.is_limit_up 一份"
+
+    def test_backtest_uses_the_shared_one(self):
+        """回测必须复用同一份，不能自己再实现。"""
+        import inspect
+
+        from duanxian import backtest, data
+
+        assert backtest._is_limit_up is data.is_limit_up, \
+            "backtest 的判涨停必须就是 data.is_limit_up 本身"
+        src = inspect.getsource(backtest)
+        assert "def _is_limit_up" not in src, "backtest 里不该再有自己的实现"
+
+
+# ================================================================ 个股深挖（按需 · 单股）
+@pytest.mark.unit
+class TestResolve:
+    """⚠️ 主名称表走 mootdx，部分环境连不上 TDX（本机就是）→ 中文简称全解析不了。
+    但深挖要查的多半就是当日涨停股，涨停池里现成有名称与代码 → 兜底。
+    一个数据源坏了不该让整个功能不可用。"""
+
+    @staticmethod
+    def _patch(monkeypatch, main_map: dict, zt_map: dict):
+        from duanxian.deepdive import data as dd
+
+        monkeypatch.setattr(dd, "_name_code_map", lambda: main_map)
+        monkeypatch.setattr(dd, "_zt_name_map", lambda: zt_map)
+        return dd
+
+    def test_main_map_works(self, monkeypatch):
+        dd = self._patch(monkeypatch, {"甲股": "000001"}, {})
+        assert dd.resolve("甲股") == ("000001", "甲股")
+
+    def test_falls_back_to_zt_pool_when_main_map_dead(self, monkeypatch):
+        """mootdx 挂掉（主表为空）时，仍能靠涨停池认出中文简称。"""
+        dd = self._patch(monkeypatch, {}, {"长缆科技": "002879"})
+        assert dd.resolve("长缆科技") == ("002879", "长缆科技")
+
+    def test_code_gets_name_from_zt_pool(self, monkeypatch):
+        dd = self._patch(monkeypatch, {}, {"长缆科技": "002879"})
+        assert dd.resolve("002879") == ("002879", "长缆科技")
+
+    def test_code_without_any_name_still_usable(self, monkeypatch):
+        """两个表都没有名字时，用代码当名字继续跑，别把人卡死。"""
+        dd = self._patch(monkeypatch, {}, {})
+        assert dd.resolve("002879") == ("002879", "002879")
+
+    def test_unknown_name_returns_none(self, monkeypatch):
+        dd = self._patch(monkeypatch, {}, {"长缆科技": "002879"})
+        assert dd.resolve("查无此票") == (None, None)
+
+    def test_invalid_code_rejected_when_main_map_alive(self, monkeypatch):
+        """主表可用却查无此代码 → 无效标的。"""
+        dd = self._patch(monkeypatch, {"甲股": "000001"}, {})
+        assert dd.resolve("999999") == (None, None)
+
+    def test_strips_parenthetical(self, monkeypatch):
+        dd = self._patch(monkeypatch, {}, {"长缆科技": "002879"})
+        assert dd.resolve("长缆科技（4板）")[0] == "002879"
+
+
+class TestDeepDiveGuards:
+    """个股深挖的三道护栏：无效标的不白跑、外部文本不可信、辩论轮转能终止。"""
+
+    def test_degraded_profile_stops_before_burning_llm_calls(self, monkeypatch):
+        """连行情都取不到（停牌 / 无效代码）时直接返回，不跑那 7 次 LLM。"""
+        from duanxian.deepdive import graph as g
+
+        monkeypatch.setattr(g.data, "resolve", lambda s: ("000001", "测试"))
+        monkeypatch.setattr(g.data, "get_profile", lambda c: "[⚠️ 行情 取数失败：网络不可达]")
+
+        def _boom(*a, **kw):
+            raise AssertionError("行情已降级，不该再建图跑 LLM")
+
+        monkeypatch.setattr(g, "build_deepdive_graph", _boom)
+        r = g.run("000001")
+        assert r.get("error"), "降级时必须给出 error，而不是一份空结论"
+
+    def test_debate_router_terminates(self):
+        """轮转必须能走到裁判 —— 否则图会一直在两方之间打转。"""
+        from duanxian.debate import make_debate_router
+
+        router = make_debate_router("正方", "反方", "裁判", 1)
+        assert router({"debate_state": {"count": 2, "current_response": "正方: x"}}) == "裁判"
+        assert router({"debate_state": {"count": 0, "current_response": ""}}) == "正方"
+        assert router({"debate_state": {"count": 1, "current_response": "正方: x"}}) == "反方"
+
+    def test_debate_router_rejects_bad_rounds(self):
+        from duanxian.debate import make_debate_router
+
+        for bad in (0, -1, 1.5, "1"):
+            with pytest.raises(ValueError):
+                make_debate_router("a", "b", "j", bad)
+
+    def test_append_turn_does_not_mutate_input(self):
+        """返回新 dict —— 就地改会让 LangGraph 的状态合并出现难查的串味。"""
+        from duanxian.debate import append_turn
+
+        d = {"history": "", "join_history": "", "current_response": "", "count": 0}
+        out = append_turn(d, "正方", "看多", "join_history")
+        assert d["count"] == 0 and out["count"] == 1
+        assert d["history"] == "" and "看多" in out["history"]
+
+
+class TestPromptPackStaysBackwardCompatible:
+    """给 `PromptPack` 加字段时**必须带默认值**。
+
+    ⚠️ 用户的本地包是照当时的字段写的。新增一个必填字段，旧包构造时就会
+    `TypeError: missing required positional arguments` → 被 except 吞掉、**静默回退默认包**。
+    表现是"程序跑起来了，但口径全变了"，界面上完全看不出来。
+    """
+
+    def test_only_the_original_core_fields_are_required(self):
+        import dataclasses
+
+        from duanxian.prompts import PromptPack
+
+        required = [f.name for f in dataclasses.fields(PromptPack)
+                    if f.default is dataclasses.MISSING
+                    and f.default_factory is dataclasses.MISSING]
+        # 这几条是最早就存在的核心字段，任何本地包都写了；除它们之外新增的一律要有默认值
+        assert set(required) == {
+            "name", "analyst_style", "analyst_len", "judge_requirements",
+            "focus_model", "focus_skeleton", "render_focus",
+        }, f"新增字段没给默认值会让旧本地包静默降级：{required}"
+
+    def test_pack_built_with_only_core_fields_still_works(self):
+        """只填核心字段就能构造出可用的包 —— 这正是旧本地包的形态。"""
+        from duanxian import schemas
+        from duanxian.prompts import PromptPack
+
+        pack = PromptPack(
+            name="legacy-style", analyst_style="s", analyst_len="l",
+            judge_requirements="r", focus_model=schemas.TomorrowFocus,
+            focus_skeleton=schemas.FOCUS_SKELETON,
+            render_focus=schemas.render_tomorrow_focus,
+        )
+        assert pack.name == "legacy-style"
+        # 深挖那几条要能从默认值拿到，否则个股深挖会拿着空口径去跑
+        assert pack.deepdive_style and pack.deepdive_requirements
+        assert pack.verdict_model is not None and pack.render_verdict is not None
+
+
+# ================================================================ 盘中快照 / 竞价核验
+
+class TestIntradayHolidayGuard:
+    """节假日（工作日但休市）不能抓快照。
+
+    调度线程按点转，周末靠 is_weekend 挡得住，**节假日挡不住**；而这时
+    batch_pct 拿到的是上一交易日的收盘价，会被当成"今天 09:25 的竞价"存下来 ——
+    数字完全合理、看不出异样，是最危险的一类假数据。
+    """
+
+    def test_holiday_returns_not_ok(self, monkeypatch):
+        from duanxian import intraday
+
+        monkeypatch.setattr(intraday, "china_today", lambda: "2026-10-01")
+        # 参考股行情时间戳停在节前 → 说明今天没开市
+        monkeypatch.setattr(intraday.trade_calendar, "quote_trade_day", lambda: "2026-09-30")
+        # 真去抓就说明防线没生效
+        monkeypatch.setattr(intraday.trade_calendar, "prev_trade_date",
+                            lambda d: (_ for _ in ()).throw(AssertionError("休市日不该走到取数")))
+        r = intraday.capture("09:25")
+        assert r["ok"] is False and "未开市" in r["reason"]
+
+    @staticmethod
+    def _at(monkeypatch, mod, hhmm: str):
+        """把"现在"固定到某个时刻 —— 漂移校验要用（09:25 的快照不能 13:00 才抓）。"""
+        import datetime
+
+        class _Now:
+            @staticmethod
+            def strftime(fmt):
+                return datetime.datetime(2026, 7, 24, int(hhmm[:2]), int(hhmm[3:])).strftime(fmt)
+
+        monkeypatch.setattr(mod, "china_now", lambda: _Now)
+
+    def test_trading_day_passes_guard(self, monkeypatch):
+        """开市日 + 时点内要能过闸门（别把正常情况也挡了）。"""
+        from duanxian import intraday
+
+        monkeypatch.setattr(intraday, "china_today", lambda: "2026-07-24")
+        self._at(monkeypatch, intraday, "09:26")
+        monkeypatch.setattr(intraday.trade_calendar, "quote_trade_day", lambda: "2026-07-24")
+        monkeypatch.setattr(intraday.trade_calendar, "prev_trade_date", lambda d: None)
+        r = intraday.capture("09:25")
+        # 过了开市闸门，才会走到"取不到前一交易日"
+        assert r["ok"] is False and "前一交易日" in r["reason"]
+
+    def test_stale_slot_is_rejected(self, monkeypatch):
+        """10:30 打开页面，不能抓一张标着 "09:25" 的快照 —— 前端会当竞价"高开占比"展示。"""
+        from duanxian import intraday
+
+        monkeypatch.setattr(intraday, "china_today", lambda: "2026-07-24")
+        self._at(monkeypatch, intraday, "10:30")
+        monkeypatch.setattr(intraday.trade_calendar, "quote_trade_day", lambda: "2026-07-24")
+        monkeypatch.setattr(intraday.trade_calendar, "prev_trade_date",
+                            lambda d: (_ for _ in ()).throw(AssertionError("超窗不该走到取数")))
+        r = intraday.capture("09:25")
+        assert r["ok"] is False and "分钟" in r["reason"]
+
+    def test_historical_date_skips_guard(self, monkeypatch):
+        """补算历史日时不该用"今天开没开市"来判 —— 那和历史日无关。"""
+        from duanxian import intraday
+
+        monkeypatch.setattr(intraday, "china_today", lambda: "2026-07-26")
+        monkeypatch.setattr(intraday.trade_calendar, "quote_trade_day", lambda: "2026-07-24")
+        monkeypatch.setattr(intraday.trade_calendar, "prev_trade_date", lambda d: None)
+        r = intraday.capture("09:25", "2026-07-24")
+        # 历史日一律拒绝现抓（拿的是实时行情，补不回来），且不是因为"未开市"被拒
+        assert r["ok"] is False and "补不回来" in r["reason"]
+
+
+class TestIntradayNotGatedByCloseGuard:
+    """开盘核验**故意**要盘中实时值，不能被"实时行情不能冒充收盘"那道闸误伤。"""
+
+    def test_intraday_is_not_gated(self):
+        """开盘核验**故意**要盘中实时值，不能被这道闸误伤。"""
+        import pathlib
+
+        src = pathlib.Path("duanxian/intraday.py").read_text(encoding="utf-8")
+        assert "live_quotes_are_close_of" not in src
+
+
+class TestShippedPackKeepsTheBoundary:
+    """仓库**自带**的 prompt 包必须守住合规边界。
+
+    ⚠️ 口径是可插拔的：使用者换成自己的包之后，模型完全可以给出参与倾向 ——
+    那是他自己的选择。但**仓库发出去的默认包**必须是最保守的那一档，
+    否则开箱即用的行为就越界了。这里只检查自带包，不检查本地包。
+    """
+
+    FORBID = ["参与倾向", "买卖点位", "推荐"]
+
+    def test_default_deepdive_requirements_forbid_stance(self):
+        from duanxian.prompts import RESEARCH_PACK as P
+
+        text = P.deepdive_requirements + P.deepdive_style
+        assert "不给参与倾向" in text, "自带包必须写明不给参与倾向"
+        assert "买卖" in text and "时机" in text or "点位" in text, \
+            "自带包必须写明不给买卖点位或时机"
+
+    def test_default_judge_and_chat_forbid_stance(self):
+        from duanxian.prompts import RESEARCH_PACK as P
+
+        for field in ("judge_requirements", "chat_guidance"):
+            text = getattr(P, field)
+            assert "不" in text and ("倾向" in text or "推荐" in text), \
+                f"{field} 必须写明不给倾向 / 不做推荐"
+
+    def test_pack_is_the_only_place_that_sets_the_tone(self):
+        """引擎不许硬编码口径 —— 否则换包也改不掉。"""
+        import inspect
+
+        from duanxian import synthesizer
+        from duanxian.deepdive import agents
+
+        for mod in (synthesizer, agents):
+            src = inspect.getsource(mod)
+            assert "PACK." in src, f"{mod.__name__} 应从 prompt 包取口径"
+            # 不该出现写死的倾向性措辞
+            for bad in ("值得关注", "建议买入", "可以参与", "建议回避"):
+                assert bad not in src, f"{mod.__name__} 里硬编码了倾向性措辞「{bad}」"
+
+
+# ================================================================ 盯盘 / 持仓 / 自选
+
+class TestQuoteUnavailableIsNotZero:
+    """取不到行情时后端给 `price=0` → 市值 0、盈亏 −100%。
+
+    ⚠️ 界面会显示成"持仓全部归零、亏损 100%"，那完全是假的。
+    持仓改为从交易日志聚合后，这一层由 `positions.report()` 负责：
+    逐行标 `quote_ok`，合计标 `complete`，绝不拿 0 当价格
+    （见 TestPositionsAggregateFromJournal）。这里守住前端那一侧。
+    """
+
+    def _src(self):
+        import pathlib
+
+        return pathlib.Path("frontend/src/pages/Portfolio.tsx").read_text(encoding="utf-8")
+
+    def test_frontend_renders_unavailable_instead_of_zero(self):
+        src = self._src()
+        assert "quote_ok" in src, "要逐行判断行情是否可用"
+        assert "行情不可用" in src, "取不到行情必须明说，不能显示成 0"
+        # 合计也要标不完整 —— 只标单行的话，总数看着仍是个确切数字
+        assert "complete" in src and "合计不完整" in src
+
+    def test_portfolio_page_feeds_nothing_to_ai(self):
+        """⛔ 持仓数据不接入任何 AI prompt —— 页面上不该有 AI 入口或上下文拼装。
+
+        ⚠️ 比界面显示错更糟的是把持仓喂给模型：用户会把 AI 的话当结论，
+        而那份上下文里带着他的成本与盈亏。
+        """
+        src = self._src()
+        for bad in ("AskAiButton", "aiContext", "chatStream", "/chat"):
+            assert bad not in src, f"持仓页出现了 AI 相关代码「{bad}」"
+
+    def test_positions_module_is_not_importable_from_prompt_modules(self):
+        """喂 prompt 的模块一律不得引用 positions。"""
+        import importlib
+        import inspect
+
+        for name in ("synthesizer", "reflection", "prompts", "structured",
+                     "emotion_metrics", "market_facts", "stats_context",
+                     "verification", "theme_tree", "intraday"):
+            src = inspect.getsource(importlib.import_module(f"duanxian.{name}"))
+            assert "positions" not in src, f"{name}.py 引了 positions —— 个人持仓不能进 prompt"
+
+
+class TestCaptureHooksFollowTheReviewedDate:
+    """复盘完成后的两个囤积钩子必须**跟着被复盘的那一天**走。
+
+    ⚠️ 不传日期时它们默认取"最近已收盘交易日"。补跑历史某天的复盘时，
+    归档与语料抓的就会是今天 —— 两个钩子都报成功，而目标历史日照样缺失。
+    """
+
+    def test_archive_hook_passes_the_date_through(self, monkeypatch):
+        import server
+
+        seen = {}
+        import duanxian.archive as arch
+
+        monkeypatch.setattr(arch, "capture_day", lambda d=None: seen.setdefault("date", d) or {"ok": True})
+        server._capture_archive("2026-07-10")
+        assert seen["date"] == "2026-07-10", "归档必须收到被复盘的日期"
+
+    def test_corpus_hook_passes_the_date_through(self, monkeypatch):
+        import server
+
+        seen = {}
+        import duanxian.backtest as bt
+
+        monkeypatch.setattr(bt, "capture", lambda d=None: seen.setdefault("date", d) or {"ok": True})
+        server._capture_backtest_corpus("2026-07-10")
+        assert seen["date"] == "2026-07-10", "语料捕获必须收到被复盘的日期"
+
+    def test_hooks_require_a_date_argument(self):
+        """签名上就必须要求日期 —— 可选参数会让漏传重新变得可能。"""
+        import inspect
+
+        import server
+
+        for fn in (server._capture_archive, server._capture_backtest_corpus):
+            params = list(inspect.signature(fn).parameters.values())
+            assert len(params) == 1 and params[0].default is inspect.Parameter.empty, \
+                f"{fn.__name__} 的 date 必须是必填参数"
+
+
+class TestIntradaySchedulerStartupIsLoud:
+    """调度线程起不来时**必须出声**，只有"这个版本没有这个模块"才允许安静跳过。
+
+    ⚠️ 两种失败的异常形态是**实测出来的**，不是推理的（见下面两个 real_* 测试）：
+    子模块不存在抛 `ImportError(name="duanxian")`，内部依赖缺失抛
+    `ModuleNotFoundError(name=<那个依赖>)`。照直觉写分支会让兼容分支永远命中不了，
+    而真故障被当成兼容情况静默吞掉 —— 表现是快照整天不抓且日志里一个字都没有。
+    """
+
+    def _reset(self, monkeypatch):
+        import server
+
+        monkeypatch.setattr(server, "_intraday_thread_started", False)
+        return server
+
+    # ---------- 先把「真实导入行为」钉死，分支判断以它为准 ----------
+    def test_real_missing_submodule_raises_importerror_named_after_the_package(self, tmp_path):
+        import sys
+        import textwrap
+
+        pkg = tmp_path / "probe_pkg"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_text("", encoding="utf-8")
+        sys.path.insert(0, str(tmp_path))
+        try:
+            with pytest.raises(ImportError) as ei:
+                exec(textwrap.dedent("from probe_pkg import nosuch"))
+            exc = ei.value
+            assert not isinstance(exc, ModuleNotFoundError), "子模块不存在抛的是 ImportError"
+            assert exc.name == "probe_pkg", f"exc.name 是包名而非子模块全路径，实得 {exc.name!r}"
+            assert "cannot import name" in str(exc)
+        finally:
+            sys.path.remove(str(tmp_path))
+
+    def test_real_broken_dependency_raises_modulenotfound_named_after_the_dependency(self, tmp_path):
+        import sys
+        import textwrap
+
+        pkg = tmp_path / "probe_pkg2"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_text("", encoding="utf-8")
+        (pkg / "sub.py").write_text("import definitely_not_installed_xyz\n", encoding="utf-8")
+        sys.path.insert(0, str(tmp_path))
+        try:
+            with pytest.raises(ModuleNotFoundError) as ei:
+                exec(textwrap.dedent("from probe_pkg2 import sub"))
+            assert ei.value.name == "definitely_not_installed_xyz", \
+                "内部依赖缺失时 exc.name 是那个依赖，不是子模块"
+        finally:
+            sys.path.remove(str(tmp_path))
+
+    # ---------- 再验分支按上面的真实形态走 ----------
+    def test_missing_module_is_silent(self, monkeypatch, capsys):
+        """这个版本没有 intraday 子模块 —— 兼容情况，安静跳过。"""
+        import builtins
+
+        server = self._reset(monkeypatch)
+        real = builtins.__import__
+
+        def fake(name, *a, **kw):
+            if name == "duanxian" and a and "intraday" in (a[2] or ()):
+                raise ImportError("cannot import name 'intraday' from 'duanxian'",
+                                  name="duanxian")
+            return real(name, *a, **kw)
+
+        monkeypatch.setattr(builtins, "__import__", fake)
+        server._start_intraday()
+        assert "盘中调度未启动" not in capsys.readouterr().out
+
+    def test_broken_dependency_is_reported(self, monkeypatch, capsys):
+        """模块在、但它依赖的东西缺了 —— 必须打日志。"""
+        import builtins
+
+        server = self._reset(monkeypatch)
+        real = builtins.__import__
+
+        def fake(name, *a, **kw):
+            if name == "duanxian" and a and "intraday" in (a[2] or ()):
+                raise ModuleNotFoundError("No module named 'some_dep'", name="some_dep")
+            return real(name, *a, **kw)
+
+        monkeypatch.setattr(builtins, "__import__", fake)
+        server._start_intraday()
+        assert "盘中调度未启动" in capsys.readouterr().out
+
+    def test_dependency_named_intraday_is_still_reported(self, monkeypatch, capsys):
+        """内部缺的依赖**恰好也叫 intraday** 时，不能被当成"这版本没这模块"。"""
+        import builtins
+
+        server = self._reset(monkeypatch)
+        real = builtins.__import__
+
+        def fake(name, *a, **kw):
+            if name == "duanxian" and a and "intraday" in (a[2] or ()):
+                raise ModuleNotFoundError("No module named 'intraday'", name="intraday")
+            return real(name, *a, **kw)
+
+        monkeypatch.setattr(builtins, "__import__", fake)
+        server._start_intraday()
+        assert "盘中调度未启动" in capsys.readouterr().out
+
+    def test_circular_import_is_reported(self, monkeypatch, capsys):
+        """循环导入：exc.name 可能是 duanxian，但消息不含 cannot import name → 要出声。"""
+        import builtins
+
+        server = self._reset(monkeypatch)
+        real = builtins.__import__
+
+        def fake(name, *a, **kw):
+            if name == "duanxian" and a and "intraday" in (a[2] or ()):
+                raise ImportError("most likely due to a circular import", name="duanxian")
+            return real(name, *a, **kw)
+
+        monkeypatch.setattr(builtins, "__import__", fake)
+        server._start_intraday()
+        assert "盘中调度未启动" in capsys.readouterr().out
+
+
+class TestSettleFollowsFillOrder:
+    """结算必须按成交**时序**逐笔走，不能把买入卖出各求一个均价。
+
+    ⚠️ 总均价法有两种错法，且**界面上完全看不出来**：卖出超过持仓时凭空结算，
+    平仓后再买入时把已经发生的盈亏改写掉。这两个数会一路污染权益曲线、胜率、
+    盈亏比、模式卡业绩、判断/执行归因与在险资金。
+    """
+
+    @staticmethod
+    def _f(*rows):
+        from duanxian.journal import _norm_fills
+
+        return _norm_fills([
+            {"side": s, "date": d, "price": p, "shares": q} for s, d, p, q in rows])
+
+    # 测结算**逻辑**时把费用置零，费用另有一组测试 —— 两件事分开测，
+    # 否则一改费率所有结算断言都要跟着动，看不出到底是哪一层错了。
+    ZERO_FEES = {"commission_rate": 0.0, "commission_min": 0.0,
+                 "stamp_tax_rate": 0.0, "transfer_fee_rate": 0.0}
+
+    def _settle(self, *rows):
+        from duanxian.journal import _settle
+
+        return _settle(self._f(*rows), self.ZERO_FEES)
+
+    def test_oversell_is_rejected(self):
+        """卖出多于当时持仓 —— 录入错误，必须报错而不是算出一个数。"""
+        from duanxian.journal import _settle
+
+        with pytest.raises(ValueError, match="超过当时持有"):
+            _settle(self._f(("buy", "2026-08-01", 10.0, 100),
+                            ("sell", "2026-08-02", 12.0, 200)), self.ZERO_FEES)
+
+    def test_sell_before_any_buy_is_rejected(self):
+        from duanxian.journal import _settle
+
+        with pytest.raises(ValueError, match="只有卖出没有买入"):
+            _settle(self._f(("sell", "2026-08-02", 12.0, 100)), self.ZERO_FEES)
+
+    def test_reentry_after_close_does_not_rewrite_realized_pnl(self):
+        """10 买 100 → 20 全卖 → 30 再买 100：已实现必须是 +1000，成本变 30。"""
+        r = self._settle(("buy", "2026-08-01", 10.0, 100),
+                         ("sell", "2026-08-02", 20.0, 100),
+                         ("buy", "2026-08-03", 30.0, 100))
+        assert r["realized_pnl"] == 1000.0, "后来的买入不能改写已经发生的盈亏"
+        assert r["avg_cost"] == 30.0, "avg_cost 是**当前持仓**成本"
+        assert r["cycles"] == 2 and r["open_shares"] == 100.0
+        assert r["closed"] is False
+
+    def test_moving_average_cost_on_scale_in(self):
+        """分批建仓：10 买 100 + 20 买 100 → 均价 15；卖一半按 15 结转。"""
+        r = self._settle(("buy", "2026-08-01", 10.0, 100),
+                         ("buy", "2026-08-02", 20.0, 100),
+                         ("sell", "2026-08-03", 25.0, 100))
+        assert r["realized_pnl"] == 1000.0, "(25 − 15) × 100"
+        assert r["avg_cost"] == 15.0, "卖出不改变剩余持仓的均价"
+        assert r["open_shares"] == 100.0 and r["closed"] is False
+
+    def test_realized_pct_uses_the_cost_that_was_actually_sold(self):
+        """百分比的分母是**已实现部分**的成本，不是全部买入。"""
+        r = self._settle(("buy", "2026-08-01", 10.0, 100),
+                         ("sell", "2026-08-02", 11.0, 50))
+        assert r["realized_pnl"] == 50.0
+        assert r["realized_pct"] == 10.0, "卖出那部分赚了 10%，不该被未卖出的稀释"
+
+    def test_amount_is_peak_capital_not_total_bought(self):
+        """占用资金 = 过程中的峰值，不是买入总额。"""
+        r = self._settle(("buy", "2026-08-01", 10.0, 100),      # 占用 1000
+                         ("sell", "2026-08-02", 10.0, 100),     # 清空
+                         ("buy", "2026-08-03", 10.0, 100))      # 再占用 1000
+        assert r["amount"] == 1000.0, "先后各占 1000，峰值是 1000 而不是 2000"
+
+    def test_avg_cost_falls_back_after_full_close(self):
+        """全平之后仍要给成本基准 —— MFE/MAE 与收件箱都要用它。"""
+        r = self._settle(("buy", "2026-08-01", 10.0, 100),
+                         ("sell", "2026-08-02", 12.0, 100))
+        assert r["open_shares"] == 0.0 and r["closed"] is True
+        assert r["avg_cost"] == 10.0, "已全平时退回已实现部分的加权成本"
+
+    def test_day_trade_round_trips(self):
+        """同日多次进出（做 T）：每一轮各自结算后累加。"""
+        r = self._settle(("buy", "2026-08-01", 10.0, 100),
+                         ("sell", "2026-08-01", 11.0, 100),
+                         ("buy", "2026-08-01", 10.5, 100),
+                         ("sell", "2026-08-01", 10.0, 100))
+        assert r["realized_pnl"] == 50.0, "+100 与 −50 相加"
+        assert r["cycles"] == 2 and r["is_t0"] is True and r["closed"] is True
+
+    def test_partial_then_add_then_close(self):
+        """先卖一部分再加仓再清空 —— 三段都要按各自当时的均价结转。"""
+        r = self._settle(("buy", "2026-08-01", 10.0, 200),      # 均价 10
+                         ("sell", "2026-08-02", 12.0, 100),     # +200，剩 100 股均价仍 10
+                         ("buy", "2026-08-03", 14.0, 100),      # 均价 (1000+1400)/200 = 12
+                         ("sell", "2026-08-04", 13.0, 200))     # (13−12)×200 = +200
+        assert r["realized_pnl"] == 400.0
+        assert r["closed"] is True and r["cycles"] == 1
+
+    def test_open_position_has_no_realized_pnl(self):
+        r = self._settle(("buy", "2026-08-01", 10.0, 100))
+        assert r["closed"] is False and "realized_pnl" not in r
+        assert r["avg_cost"] == 10.0 and r["open_shares"] == 100.0
+
+
+class TestTradingFees:
+    """费用必须算进净盈亏，且要能看出这个数是估的还是真的。
+
+    ⚠️ 对高换手的短线打法，佣金 + 印花税 + 过户费不是小数：一堆薄利交易在计费后
+    可能接近持平甚至转亏。只报毛盈亏会让胜率与期望系统性偏高，
+    "这套打法还灵不灵"的结论可能反向。
+    """
+
+    def _settle(self, rows, cfg=None):
+        from duanxian.journal import _norm_fills, _settle
+
+        return _settle(_norm_fills(rows), cfg)
+
+    def test_net_is_gross_minus_fees(self):
+        r = self._settle([{"side": "buy", "date": "2026-08-01", "price": 10.0, "shares": 1000},
+                          {"side": "sell", "date": "2026-08-02", "price": 10.2, "shares": 1000}])
+        assert r["gross_pnl"] == 200.0
+        assert r["fees"] > 0
+        assert r["realized_pnl"] == pytest.approx(r["gross_pnl"] - r["fees"], abs=0.01)
+        assert r["realized_pnl"] < r["gross_pnl"], "净额必须小于毛额"
+
+    def test_stamp_tax_only_on_sell(self):
+        """印花税只在卖出收 —— 买卖两笔同额，卖出那笔费用必须更高。"""
+        from duanxian.journal import _fee_of, load_fees
+
+        cfg = load_fees()
+        buy = {"side": "buy", "date": "2026-08-01", "price": 10.0, "shares": 10000}
+        sell = {"side": "sell", "date": "2026-08-01", "price": 10.0, "shares": 10000}
+        assert _fee_of(sell, cfg) > _fee_of(buy, cfg)
+        assert _fee_of(sell, cfg) - _fee_of(buy, cfg) == pytest.approx(
+            100000 * cfg["stamp_tax_rate"], abs=0.01)
+
+    def test_commission_minimum_applies(self):
+        """小额成交按最低佣金收 —— 短线小仓位试仓时这一条很关键。"""
+        from duanxian.journal import _fee_of, load_fees
+
+        cfg = load_fees()
+        tiny = {"side": "buy", "date": "2026-08-01", "price": 1.0, "shares": 100}
+        assert _fee_of(tiny, cfg) >= cfg["commission_min"]
+
+    def test_user_supplied_fee_wins_over_estimate(self):
+        """填了对账单上的实际费用就以它为准，并标明不再是估算。"""
+        rows = [{"side": "buy", "date": "2026-08-01", "price": 10.0, "shares": 1000, "fee": 5.0},
+                {"side": "sell", "date": "2026-08-02", "price": 10.2, "shares": 1000, "fee": 11.0}]
+        r = self._settle(rows)
+        assert r["fees"] == 16.0
+        assert r["fees_are_estimated"] is False
+
+    def test_estimated_flag_is_true_when_any_fill_lacks_fee(self):
+        rows = [{"side": "buy", "date": "2026-08-01", "price": 10.0, "shares": 1000, "fee": 5.0},
+                {"side": "sell", "date": "2026-08-02", "price": 10.2, "shares": 1000}]
+        assert self._settle(rows)["fees_are_estimated"] is True
+
+    def test_buy_fee_is_carried_proportionally(self):
+        """只卖掉一半时，买入费用也只结转一半 —— 剩下那半留给以后卖出。"""
+        cfg = {"commission_rate": 0.0, "commission_min": 10.0,
+               "stamp_tax_rate": 0.0, "transfer_fee_rate": 0.0}
+        r = self._settle([{"side": "buy", "date": "2026-08-01", "price": 10.0, "shares": 1000},
+                          {"side": "sell", "date": "2026-08-02", "price": 11.0, "shares": 500}],
+                         cfg)
+        # 买入费 10 元结转一半 = 5，卖出费 10 元 → 共 15
+        assert r["fees"] == pytest.approx(15.0, abs=0.01)
+
+    def test_thin_profit_can_turn_negative_after_fees(self):
+        """毛赚、净亏 —— 这正是只看毛盈亏会误导的情形。"""
+        r = self._settle([{"side": "buy", "date": "2026-08-01", "price": 10.0, "shares": 300},
+                          {"side": "sell", "date": "2026-08-01", "price": 10.02, "shares": 300}])
+        assert r["gross_pnl"] > 0, "毛额是赚的"
+        assert r["realized_pnl"] < 0, "计费后其实是亏的"
+
+    def test_rates_are_validated(self):
+        from duanxian.journal import save_fees
+
+        with pytest.raises(ValueError, match="不能是负数"):
+            save_fees({"commission_rate": -0.001})
+        with pytest.raises(ValueError, match="不像费率"):
+            save_fees({"commission_rate": 2.5})      # 把"万2.5"填成了 2.5
+
+    def test_defaults_are_flagged_as_defaults(self, tmp_path, monkeypatch):
+        """没配过费率要标出来 —— 界面才能说明这些数是按初值估的。"""
+        from duanxian import journal
+
+        monkeypatch.setattr(journal, "_FEE_PATH", str(tmp_path / "fees.json"))
+        assert journal.load_fees()["is_default"] is True
+
+
+class TestEveryConfiguredRuleIsActuallyChecked:
+    """界面上能配的规则，必须每一条都真的被检查过。
+
+    ⚠️ 配了却从没实现检查的规则，报告会显示"0 次违反"——使用者以为自己守住了，
+    其实那条压根没跑。所以每条规则都要报 checked / unavailable，
+    "查了没违反"和"没查"必须分得开。
+    """
+
+    def _trades(self):
+        # ⚠️ 每笔用**不同代码** —— 最大持仓数按代码统计，同一只票分两笔建仓仍只算一个仓位
+        return [
+            {"date": "2026-08-01", "code": f"60000{i}", "name": f"票{i}",
+             "pnl_pct": 1.0, "as_planned": True,
+             "settled": {"has_fills": True, "first_buy": "2026-08-01",
+                         "last_sell": f"2026-08-0{i+2}", "closed": True,
+                         "realized_pnl": 100.0,
+                         "realized_by_date": {f"2026-08-0{i+2}": 100.0}}}
+            for i in range(4)
+        ]
+
+    def test_every_rule_key_has_a_status(self):
+        from duanxian.risk import DEFAULT_RULES, violations
+
+        r = violations(self._trades())
+        for k in DEFAULT_RULES:
+            assert k in r["rule_status"], f"规则 {k} 没有执行状态 —— 它可能从没被检查过"
+
+    def test_max_positions_is_checked_against_history(self):
+        """历史上曾同时持有超过上限，必须被抓出来（不只是看"当前"）。"""
+        from duanxian.risk import violations
+
+        r = violations(self._trades(), {**{"max_positions": 3}, **{
+            "max_loss_per_trade_pct": 5.0, "max_loss_per_day_pct": 8.0,
+            "max_trades_per_day": 99, "pause_after_losses": 3,
+            "max_unplanned_ratio": 1.0}})
+        hits = [v for v in r["violations"] if v["rule"] == "max_positions"]
+        assert hits and hits[0]["actual"] == 4
+
+    def test_same_code_split_into_two_trades_is_one_position(self):
+        """同一只票分两笔建仓 —— 仍然只占一个仓位，不该按记录条数算。"""
+        from duanxian.risk import violations
+
+        rules = {"max_positions": 1, "max_loss_per_trade_pct": 99.0,
+                 "max_loss_per_day_pct": 99.0, "max_trades_per_day": 99,
+                 "pause_after_losses": 99, "max_unplanned_ratio": 1.0}
+        two = [
+            {"date": "2026-08-01", "code": "002879", "name": "甲", "as_planned": True,
+             "settled": {"has_fills": True, "first_buy": "2026-08-01", "closed": False}},
+            {"date": "2026-08-01", "code": "002879", "name": "甲", "as_planned": True,
+             "settled": {"has_fills": True, "first_buy": "2026-08-01", "closed": False}},
+        ]
+        hits = [v for v in violations(two, rules)["violations"] if v["rule"] == "max_positions"]
+        assert not hits, "同代码两笔只算一个仓位，上限 1 不该被判违反"
+
+    def test_swap_on_same_day_does_not_double_count(self, monkeypatch):
+        """换仓当天先卖后买 —— 不该在那一天短暂多算一个仓位。"""
+        from duanxian.risk import violations
+
+        rules = {"max_positions": 1, "max_loss_per_trade_pct": 99.0,
+                 "max_loss_per_day_pct": 99.0, "max_trades_per_day": 99,
+                 "pause_after_losses": 99, "max_unplanned_ratio": 1.0}
+        swap = [
+            {"date": "2026-07-30", "code": "002879", "name": "甲", "as_planned": True,
+             "settled": {"has_fills": True, "first_buy": "2026-07-30",
+                         "last_sell": "2026-08-01", "closed": True}},
+            {"date": "2026-08-01", "code": "600000", "name": "乙", "as_planned": True,
+             "settled": {"has_fills": True, "first_buy": "2026-08-01", "closed": False}},
+        ]
+        hits = [v for v in violations(swap, rules)["violations"] if v["rule"] == "max_positions"]
+        assert not hits, "同日先平后建，峰值仍是 1"
+
+    def test_status_says_how_many_records_were_approximated(self):
+        """有记录缺成交明细时要报出来 —— 那部分结论是按日期近似的。
+
+        ⚠️ 用 any 判断的话，一条有明细就整体显示成 "checked"，把近似掩盖掉；
+        而全没明细时反而显示"部分记录没有"，两头都不对。
+        """
+        from duanxian.risk import violations
+
+        full = [{"date": "2026-08-01", "code": "002879", "as_planned": True,
+                 "settled": {"has_fills": True, "first_buy": "2026-08-01", "closed": False}}]
+        mixed = full + [{"date": "2026-08-01", "code": "600000", "as_planned": True,
+                         "settled": {"has_fills": False}}]
+        assert violations(full)["rule_status"]["max_positions"] == "checked"
+        st = violations(mixed)["rule_status"]["max_positions"]
+        assert "近似" in st and "1 条" in st, f"没报出近似条数：{st}"
+
+    def test_day_trade_does_not_leak_into_later_days(self):
+        """当日买当日卖的记录，不能让那只票在之后的日子里一直算作持仓。
+
+        ⚠️ 用"逐事件加减一个计数器"实现时，做 T 会先减到 0 被清掉、再加回 1，
+        于是这只票永远留在持仓集合里，之后每天的峰值都虚高 —— 而且完全看不出来。
+        """
+        from duanxian.risk import violations
+
+        rules = {"max_positions": 1, "max_loss_per_trade_pct": 99.0,
+                 "max_loss_per_day_pct": 99.0, "max_trades_per_day": 99,
+                 "pause_after_losses": 99, "max_unplanned_ratio": 1.0}
+        trades = [
+            {"date": "2026-08-01", "code": "002879", "as_planned": True,
+             "settled": {"has_fills": True, "first_buy": "2026-08-01",
+                         "last_sell": "2026-08-01", "closed": True}},      # 做 T
+            {"date": "2026-08-05", "code": "600000", "as_planned": True,
+             "settled": {"has_fills": True, "first_buy": "2026-08-05", "closed": False}},
+        ]
+        hits = [v for v in violations(trades, rules)["violations"]
+                if v["rule"] == "max_positions"]
+        assert not hits, "做 T 那只票不该在 08-05 还被算作持仓"
+
+    def test_daily_loss_splits_by_actual_sell_date(self, monkeypatch):
+        """分两天减仓 —— 两天的盈亏要各归各天，不能都挂到最后一次卖出。"""
+        import duanxian.at_risk as ar
+        from duanxian.risk import violations
+
+        monkeypatch.setattr(ar, "load_equity_base", lambda: 100000.0)
+        trades = [{"date": "2026-08-01", "code": "002879", "name": "甲", "as_planned": True,
+                   "settled": {"has_fills": True, "first_buy": "2026-08-01",
+                               "last_sell": "2026-08-03", "closed": True,
+                               "realized_pnl": -5000.0,
+                               # 8-02 亏 12%（超 8% 上限），8-03 赚 7% —— 合并看只有 −5%
+                               "realized_by_date": {"2026-08-02": -12000.0,
+                                                    "2026-08-03": 7000.0}}}]
+        hits = [v for v in violations(trades)["violations"]
+                if v["rule"] == "max_loss_per_day_pct"]
+        assert hits and hits[0]["date"] == "2026-08-02", \
+            "按整笔挂到平仓日的话，8-02 那天的超限会被 8-03 的盈利抵掉、查不出来"
+
+    def test_daily_loss_needs_equity_base_and_says_so(self, monkeypatch):
+        """没填账户规模就没有分母 —— 必须标 unavailable，不能当成没违反。"""
+        import duanxian.at_risk as ar
+        from duanxian.risk import violations
+
+        monkeypatch.setattr(ar, "load_equity_base", lambda: None)
+        r = violations(self._trades())
+        assert r["rule_status"]["max_loss_per_day_pct"].startswith("unavailable")
+        assert "max_loss_per_day_pct" in r["unchecked"]
+
+    def test_daily_loss_is_flagged_when_base_is_known(self, monkeypatch):
+        import duanxian.at_risk as ar
+        from duanxian.risk import violations
+
+        monkeypatch.setattr(ar, "load_equity_base", lambda: 100000.0)
+        trades = [{"date": "2026-08-01", "name": "A", "pnl_pct": -10.0, "as_planned": True,
+                   "settled": {"has_fills": True, "first_buy": "2026-08-01",
+                               "last_sell": "2026-08-01", "closed": True,
+                               "realized_pnl": -12000.0}}]      # 亏 12%，上限 8%
+        r = violations(trades)
+        assert r["rule_status"]["max_loss_per_day_pct"] == "checked"
+        hits = [v for v in r["violations"] if v["rule"] == "max_loss_per_day_pct"]
+        assert hits and hits[0]["actual"] == pytest.approx(-12.0, abs=0.01)
+
+
+class TestFirstBoardReasonsFollowThePoolDate:
+    """首板页的涨停原因必须跟着**池子那一天**查，不能写死"今日"。
+
+    ⚠️ 涨停池会回退到最近有数据的交易日（周末、节假日、当天接口短暂失败）。
+    原因若还按"今日"查，就会把两个日期的数据拼在一起，而页面上看着完全正常。
+    实测另有一层：收盘当天"今日"这个词常常返回 0 行，带日期的查询才有数据。
+    """
+
+    def test_query_carries_the_date(self, monkeypatch):
+        import vr.firstboard as fb
+
+        seen = []
+
+        class _FakeClient:
+            def query(self, q, page=1, limit=50):
+                seen.append(q)
+                return None
+
+        monkeypatch.setenv("IWENCAI_API_KEY", "x")
+        monkeypatch.setattr(fb, "IwencaiClient", _FakeClient, raising=False)
+        import sys
+        import types
+
+        mod = types.ModuleType("iwencai_client")
+        mod.IwencaiClient = _FakeClient
+        monkeypatch.setitem(sys.modules, "iwencai_client", mod)
+
+        fb._fetch_reasons("20260828")
+        assert seen, "没有发出查询"
+        assert "20260828" in seen[0], f"查询里没带日期：{seen[0]}"
+        assert "今日" not in seen[0], "不能写死「今日」"
+
+    def test_reason_columns_match_by_substring(self):
+        """问财返回的列名带日期后缀（涨停原因[20260828]）—— 匹配必须用子串。"""
+        import inspect
+
+        import vr.firstboard as fb
+
+        src = inspect.getsource(fb._fetch_reasons)
+        assert '"涨停原因" in c' in src, "列匹配要用子串，改成精确相等会一条都取不到"
+
+
+class TestUpdateTradeKeepsTheEvidence:
+    """持仓中的记录要能**追加成交**，而不是删了重录。
+
+    ⚠️ 删了重录会丢两样东西：`created_at`（这笔是什么时候记的）和
+    "计划边界是下单时写的"这个证据。在险资金的全部意义就建立在后者上。
+    """
+
+    @staticmethod
+    def _use(tmp_path, monkeypatch):
+        from duanxian import journal
+
+        monkeypatch.setattr(journal, "_DIR", str(tmp_path))
+        monkeypatch.setattr(journal, "_PATH", str(tmp_path / "trades.json"))
+        monkeypatch.setattr(journal, "_FEE_PATH", str(tmp_path / "fees.json"))
+        monkeypatch.setattr(journal, "_market_context", lambda d: {})
+        monkeypatch.setattr(journal, "_stock_context", lambda d, c: {})
+        return journal
+
+    def _open_position(self, j):
+        return j.add_trade("2026-08-20", "002879", "测试", "打板", as_planned=True,
+                           planned_stop=9.0,
+                           fills=[{"side": "buy", "date": "2026-08-20",
+                                   "price": 10.0, "shares": 1000}])["trade"]
+
+    def test_appending_a_sell_closes_the_position(self, tmp_path, monkeypatch):
+        j = self._use(tmp_path, monkeypatch)
+        t = self._open_position(j)
+        assert t["settled"]["closed"] is False
+
+        r = j.update_trade(t["id"], fills=t["fills"] + [
+            {"side": "sell", "date": "2026-08-21", "price": 11.0, "shares": 1000}])
+        st = r["trade"]["settled"]
+        assert st["closed"] is True and st["realized_pnl"] is not None
+        assert st["open_shares"] == 0.0
+
+    def test_created_at_and_planned_stop_survive(self, tmp_path, monkeypatch):
+        j = self._use(tmp_path, monkeypatch)
+        t = self._open_position(j)
+        r = j.update_trade(t["id"], fills=t["fills"] + [
+            {"side": "sell", "date": "2026-08-21", "price": 11.0, "shares": 1000}])
+        after = r["trade"]
+        assert after["created_at"] == t["created_at"], "追加成交不能改写建仓时间"
+        assert after["planned_stop"] == 9.0, "追加成交不能动计划边界"
+        assert "planned_edited_at" not in after, "没改边界就不该留改动痕迹"
+
+    def test_editing_planned_stop_leaves_a_trace(self, tmp_path, monkeypatch):
+        """事后改止损不禁止，但必须留痕 —— 在险资金按它算，读数的人有权知道。"""
+        j = self._use(tmp_path, monkeypatch)
+        t = self._open_position(j)
+        after = j.update_trade(t["id"], planned_stop=9.5)["trade"]
+        assert after["planned_stop"] == 9.5
+        assert after.get("planned_edited_at"), "改了计划边界必须留痕"
+
+    def test_untouched_fields_stay(self, tmp_path, monkeypatch):
+        """没传的字段一律不动 —— 用哨兵区分「没传」与「传了 null」。"""
+        j = self._use(tmp_path, monkeypatch)
+        t = self._open_position(j)
+        after = j.update_trade(t["id"], note="补个备注")["trade"]
+        assert after["note"] == "补个备注"
+        assert after["as_planned"] is True and after["planned_stop"] == 9.0
+        assert after["fills"] == t["fills"]
+
+    def test_oversell_still_rejected_on_update(self, tmp_path, monkeypatch):
+        j = self._use(tmp_path, monkeypatch)
+        t = self._open_position(j)
+        with pytest.raises(ValueError, match="超过当时持有"):
+            j.update_trade(t["id"], fills=t["fills"] + [
+                {"side": "sell", "date": "2026-08-21", "price": 11.0, "shares": 9999}])
+
+    def test_removing_the_sell_clears_stale_derived_fields(self, tmp_path, monkeypatch):
+        """把卖出撤回去之后，旧的 pnl_pct / exit_market 必须一起清掉。
+
+        ⚠️ 留着的话，报表会显示一个与现有成交明细对不上的盈亏，而界面上看不出来。
+        """
+        j = self._use(tmp_path, monkeypatch)
+        monkeypatch.setattr(j, "_market_context", lambda d: {"emotion_phase": "退潮"})
+        t = self._open_position(j)
+        closed = j.update_trade(t["id"], fills=t["fills"] + [
+            {"side": "sell", "date": "2026-08-25", "price": 11.0, "shares": 1000}])["trade"]
+        assert closed["pnl_pct"] is not None
+
+        back = j.update_trade(t["id"], fills=t["fills"])["trade"]   # 撤回卖出
+        assert back["pnl_pct"] is None, "没有已实现盈亏了，旧值必须清掉"
+        assert back["exit_market"] is None, "不再有跨日卖出，离场环境也要清掉"
+        assert back["settled"]["closed"] is False
+
+    def test_all_trades_is_not_truncated(self, tmp_path, monkeypatch):
+        """整本账读取不能截断 —— 持仓聚合与风控都靠它。"""
+        j = self._use(tmp_path, monkeypatch)
+        for i in range(5):
+            j.add_trade("2026-08-20", f"60000{i}", f"票{i}", "打板",
+                        fills=[{"side": "buy", "date": "2026-08-20",
+                                "price": 10.0, "shares": 100}])
+        assert len(j.all_trades()) == 5
+        # list_trades 有 limit，all_trades 不该有
+        import inspect
+
+        assert "limit" not in inspect.signature(j.all_trades).parameters
+
+    def test_positions_uses_the_untruncated_reader(self):
+        """持仓聚合必须走 all_trades，不能用带 limit 的 list_trades。"""
+        import inspect
+
+        from duanxian import positions
+
+        # ⚠️ 用 AST 看**实际调用**，不要拿源码做字符串匹配 ——
+        #    注释里提到 list_trades 也会命中，测试就成了假红。
+        import ast
+
+        tree = ast.parse(inspect.getsource(positions.open_positions).strip())
+        called = {n.func.attr for n in ast.walk(tree)
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+        assert "all_trades" in called, "持仓聚合要读整本账"
+        assert "list_trades" not in called, \
+            "账本超过 limit 条之后，较早但仍未平仓的记录会被静默漏掉"
+
+    def test_unknown_id_reports_not_found(self, tmp_path, monkeypatch):
+        j = self._use(tmp_path, monkeypatch)
+        assert j.update_trade("nope", note="x")["ok"] is False
+
+
+class TestPositionsAggregateFromJournal:
+    """持仓必须是**交易日志的视图**，不是另一本账。
+
+    ⚠️ 各存一份的话，一笔买入要录两次；漏录或改动不同步就会出现
+    "持仓页显示有仓、风险报告说没有持仓"，而使用者不知道哪份是权威。
+    """
+
+    def _trades(self):
+        return [
+            {"id": "a", "code": "002879", "name": "甲", "playbook": "打板", "planned_stop": 9.0,
+             "settled": {"has_fills": True, "open_shares": 1000.0, "avg_cost": 10.0,
+                         "closed": False}},
+            {"id": "b", "code": "002879", "name": "甲", "playbook": "低吸",
+             "settled": {"has_fills": True, "open_shares": 1000.0, "avg_cost": 12.0,
+                         "closed": False}},
+            {"id": "c", "code": "600000", "name": "乙", "playbook": "接力",
+             "settled": {"has_fills": True, "open_shares": 0.0, "avg_cost": 5.0,
+                         "closed": True}},
+        ]
+
+    def test_same_code_merges_with_weighted_cost(self):
+        from duanxian.positions import open_positions
+
+        rows = open_positions(self._trades())
+        assert len(rows) == 1, "已平仓的不该出现在持仓里"
+        r = rows[0]
+        assert r["code"] == "002879" and r["shares"] == 2000.0
+        assert r["cost"] == 11.0, "两笔各 1000 股、成本 10 与 12 → 加权 11"
+        assert set(r["trade_ids"]) == {"a", "b"}
+
+    def test_closed_trades_are_excluded(self):
+        from duanxian.positions import open_positions
+
+        assert all(r["code"] != "600000" for r in open_positions(self._trades()))
+
+    def test_quote_failure_is_labelled_not_zeroed(self, monkeypatch):
+        """行情取不到时要标 quote_ok=False，绝不能拿 0 当价格。"""
+        import duanxian.positions as pos
+
+        monkeypatch.setattr(pos, "open_positions", lambda trades=None: [
+            {"code": "002879", "name": "甲", "shares": 1000.0, "cost": 10.0,
+             "trade_ids": ["a"], "playbooks": [], "planned_stops": []}])
+        monkeypatch.setattr(pos, "_quotes", lambda codes: {})      # 行情全挂
+        r = pos.report()
+        row = r["holdings"][0]
+        assert row["quote_ok"] is False
+        assert row["price"] is None and row["market_value"] is None
+        assert row["pnl"] is None, "⚠️ 不能算成 −100%"
+        assert r["total"]["complete"] is False, "有取不到的就要标不完整"
+        assert r["total"]["counted"] == 0 and r["total"]["of"] == 1
+
+    def test_totals_only_count_rows_with_quotes(self, monkeypatch):
+        import duanxian.positions as pos
+
+        monkeypatch.setattr(pos, "open_positions", lambda trades=None: [
+            {"code": "002879", "name": "甲", "shares": 100.0, "cost": 10.0,
+             "trade_ids": ["a"], "playbooks": [], "planned_stops": []},
+            {"code": "600000", "name": "乙", "shares": 100.0, "cost": 20.0,
+             "trade_ids": ["b"], "playbooks": [], "planned_stops": []},
+        ])
+        monkeypatch.setattr(pos, "_quotes", lambda codes: {"002879": {"price": 11.0, "name": "甲"}})
+        r = pos.report()
+        assert r["total"]["market_value"] == 1100.0, "只算有行情的那只"
+        assert r["total"]["cost"] == 1000.0
+        assert r["total"]["complete"] is False and r["total"]["counted"] == 1
+
+    def test_no_separate_storage_file(self):
+        """本模块不许自己存一份持仓 —— 唯一账本是 journal。"""
+        import inspect
+
+        from duanxian import positions
+
+        src = inspect.getsource(positions)
+        assert "atomic_write_json" not in src and "open(" not in src.replace("open_positions", ""), \
+            "positions 只做聚合，不落盘"

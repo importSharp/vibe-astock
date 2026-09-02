@@ -2,7 +2,8 @@ import { useEffect, useState } from "react";
 import { Link, Outlet, useLocation } from "react-router-dom";
 import {
   Moon, Sun, ChevronsLeft, ChevronsRight, CandlestickChart, Cog, Swords,
-  Activity, Flame, CalendarRange, Github, Bot } from "lucide-react";
+  Activity, Flame, CalendarRange, Github, Bot, NotebookPen, TrendingDown,
+  Microscope, Sunrise, Eye, Briefcase, Star, LineChart, Radio } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -29,6 +30,27 @@ const REVIEW_NAV = [
   { to: "/daily-review", icon: Activity, label: "盘面数据" },
   { to: "/first-board", icon: Flame, label: "首板分析" },
   { to: "/heat", icon: CalendarRange, label: "近5天热度" },
+  { to: "/backtest", icon: TrendingDown, label: "涨停样本统计" },
+];
+
+// 个人交易记录。⛔ 这一组的数据只在本机流动，不接入任何 AI prompt。
+const JOURNAL_NAV = [
+  { to: "/journal", icon: NotebookPen, label: "交易日志" },
+];
+
+// 盯盘与自选：看当下与自己关心的标的
+const WATCH_NAV = [
+  { to: "/watch", icon: Eye, label: "盯盘" },
+  { to: "/portfolio", icon: Briefcase, label: "持仓股" },
+  { to: "/watchlist", icon: Star, label: "自选股" },
+  { to: "/stock-data", icon: LineChart, label: "个股数据" },
+  { to: "/intel", icon: Radio, label: "资讯雷达" },
+];
+
+// 按需跑的单股 agent（与每日复盘不同：它是你点一次跑一次）
+const AGENT_NAV = [
+  { to: "/agent/intraday", icon: Sunrise, label: "盘中核验" },
+  { to: "/agent/deepdive", icon: Microscope, label: "个股深挖", agent: true },
 ];
 
 const SETTINGS_NAV = [{ to: "/settings", icon: Cog, label: "接入 AI" }];
@@ -96,6 +118,18 @@ export function Layout() {
         <nav className={cn("flex-1 space-y-0.5 overflow-auto", collapsed ? "p-1.5" : "p-2.5")}>
           {groupLabel("复盘")}
           {REVIEW_NAV.map((n) => item(n, "agent" in n && n.agent))}
+
+          {!collapsed && <div className="my-2 border-t border-border/40" />}
+          {groupLabel("盯盘与自选")}
+          {WATCH_NAV.map((n) => item(n))}
+
+          {!collapsed && <div className="my-2 border-t border-border/40" />}
+          {groupLabel("按需分析")}
+          {AGENT_NAV.map((n) => item(n, "agent" in n && n.agent))}
+
+          {!collapsed && <div className="my-2 border-t border-border/40" />}
+          {groupLabel("我的交易")}
+          {JOURNAL_NAV.map((n) => item(n))}
 
           {!collapsed && <div className="my-2 border-t border-border/40" />}
           {SETTINGS_NAV.map((n) => item(n))}

@@ -410,3 +410,312 @@ export interface WeeklyData {
 
 export interface JobStatus { running: boolean; elapsed?: number; error?: string | null; stock?: string; busy?: boolean; }
 
+// ---------- 交易日志（journal.py）----------
+export interface MarketCtx {
+  emotion_phase: string | null; money_effect_median: number | null;
+  promotion_overall: number | null; limit_up_count: number | null;
+  never_broken_rate: number | null; has_review: boolean;
+}
+export interface StockCtx {
+  in_limit_up?: boolean; boards?: number; first_seal?: string | null;
+  broken_times?: number; sector?: string; board_type?: string; was_broken?: boolean;
+}
+export interface Fill { side: "buy" | "sell"; date: string; price: number; shares: number; }
+export interface Settled {
+  has_fills: boolean; closed: boolean;
+  avg_cost?: number; avg_sell?: number; amount?: number;
+  realized_pnl?: number; realized_pct?: number;
+  // 毛额与费用分开给：realized_pnl 是**净额**（已扣费用）
+  gross_pnl?: number; fees?: number; fees_are_estimated?: boolean;
+  hold_days?: number; is_t0?: boolean;
+  buy_shares?: number; sell_shares?: number;
+  open_shares?: number;      // 当前还持有多少（>0 = 持仓中）
+  cycles?: number;           // >1 表示这条记录里有多轮进出
+  first_buy?: string; last_sell?: string | null;
+}
+export interface Trade {
+  id: string; date: string; code: string; name: string; playbook: string;
+  pnl_pct: number | null; as_planned: boolean | null; note: string;
+  market: MarketCtx; stock: StockCtx;
+  planned_stop?: number | null; planned_target?: number | null;
+  fills?: Fill[]; settled?: Settled; exit_market?: MarketCtx | null;
+}
+export interface Bucket {
+  count: number; scored: number; win_rate: number | null;
+  avg: number | null; best: number | null; worst: number | null;
+  // 盈亏金额与百分比是两个口径，仓位不同时结论可能相反
+  money_scored?: number; net_pnl?: number | null;
+}
+export interface JournalStats {
+  available: boolean; reason?: string;
+  overall?: Bucket;
+  by_phase?: Record<string, Bucket>;
+  by_playbook?: Record<string, Bucket>;
+  by_planned?: Record<string, Bucket>;
+  by_boards?: Record<string, Bucket>;
+  by_hold?: Record<string, Bucket>;
+  playbooks?: string[];
+}
+export interface TradeList { trades: Trade[]; total: number; }
+
+// ---------- 个人模式卡（modes.py）----------
+export interface ModeVersion {
+  version: number; since: string; changes: string; playbook?: string;
+  setup?: string; entry?: string; exit?: string; sizing?: string; phase?: string;
+  trades: number; win_rate: number | null; median_pct: number | null;
+  avg_pct: number | null; best: number | null; worst: number | null;
+  enough: boolean;
+}
+export interface ModePerf {
+  id: string; name: string; playbook: string; version_count: number;
+  by_version: ModeVersion[]; matched_trades: number;
+  before_card: { trades: number; win_rate: number | null; median_pct: number | null } | null;
+  latest_vs_prev: { win_rate_delta: number; median_delta: number;
+                    from_version: number; to_version: number } | null;
+  compare_blocked: boolean;
+}
+export interface ModeCard {
+  id: string; name: string; playbook: string; created_at: string;
+  versions: ModeVersion[];
+}
+export interface ModesResponse {
+  cards: ModeCard[]; playbooks_hint: string[];
+  performance: { available: boolean; reason?: string; cards?: ModePerf[];
+                 min_per_version?: number; note?: string };
+}
+
+// ---------- 账户风险与执行偏差（risk / at_risk / excursion / attribution / inbox）----------
+export interface AtRiskPosition {
+  id: string; code: string; name: string; date: string; playbook: string;
+  shares: number; avg_cost: number; capital: number;
+  planned_stop: number | null; planned_target: number | null;
+  at_risk: number | null; at_risk_pct: number | null; bounded: boolean;
+}
+export interface AtRiskReport {
+  available: boolean; reason?: string;
+  positions?: AtRiskPosition[]; position_count?: number;
+  total_capital?: number; total_at_risk?: number;
+  bounded_count?: number; unbounded_count?: number; unbounded_capital?: number;
+  equity_base?: number | null; equity_base_hint?: string;
+  at_risk_of_equity_pct?: number; capital_of_equity_pct?: number;
+  over_per_trade_limit?: { name: string; code: string; pct_of_equity: number }[];
+  over_position_limit?: { actual: number; limit: number };
+  unbounded_note?: string;
+  rules?: { max_loss_per_trade_pct?: number; max_positions?: number; is_default?: boolean };
+}
+export interface Attribution {
+  available: boolean; reason?: string;
+  days_counted?: number; enough_samples?: boolean;
+  quadrant_labels?: Record<string, string>;
+  quadrants?: Record<string, QuadrantCell>;
+  skipped_no_amount?: number; skipped_no_read?: number; note?: string;
+}
+export interface ExcursionItem {
+  code: string; name: string; date: string; exit_date: string;
+  realized_pct: number; mfe_pct: number; mae_pct: number;
+  mfe_certain: number | null; mae_certain: number | null;
+  certain_note: string | null;
+  bars: number; bars_inner: number; same_day: boolean; precision: string;
+  give_back_pct: number; capture_rate: number | null;
+  /** 捕获率为负 = 那段涨过但亏损离场，比"没吃到"更差的一档 */
+  capture_note: string | null;
+}
+export interface ExcursionSummary {
+  available: boolean; reason?: string;
+  trades?: number; failed?: number; enough_samples?: boolean;
+  median_capture_rate?: number | null; capture_samples?: number;
+  median_give_back?: number; median_mae?: number;
+  endured_count?: number; bad_entry_count?: number; same_day_count?: number;
+  lost_with_move_count?: number; capture_note?: string | null;
+  items?: ExcursionItem[]; bias_note?: string; caveat?: string;
+}
+export interface Inbox {
+  available: boolean; reason?: string;
+  items?: InboxItem[]; count?: number; scanned?: number;
+  by_flag?: Record<string, number>;
+  baseline?: { median_capital: number | null; median_hold_days: number | null;
+               history_enough: boolean; min_history: number };
+  rules_is_default?: boolean; note?: string; excursion_available?: boolean;
+}
+export interface InboxItem {
+  id: string; date: string; code: string; name: string; playbook: string;
+  pnl_pct: number | null; note: string; closed: boolean; flags: InboxFlag[];
+}
+export interface QuadrantCell { days: number; pnl: number; days_list: string[]; }
+export interface RiskReport {
+  equity?: Equity; rolling?: Rolling; discipline?: Discipline; violations?: Violations; trade_count?: number;
+}
+export interface RiskRules {
+  rules: Record<string, number> & { _is_default?: boolean };
+  labels: Record<string, string>;
+  defaults: Record<string, number>;
+}
+export interface Rolling {
+  available: boolean; reason?: string;
+  lifetime?: WindowStats; windows?: Record<string, WindowStats>;
+  /** 近 10 笔 减 终身。明显为负 = 手感在退 */
+  win_rate_drift?: number | null; profit_factor_drift?: number | null;
+  note?: string;
+}
+export interface Violation {
+  date: string; rule: string; label: string;
+  limit: number; actual: number; detail: string;
+}
+export interface WindowStats {
+  window?: number; enough?: boolean; trades: number;
+  net_pnl?: number; win_rate?: number | null;
+  avg_win?: number | null; avg_loss?: number | null;
+  payoff_ratio?: number | null; profit_factor?: number | null;
+  execution_rate?: number | null;
+  date_from?: string; date_to?: string;
+}
+export interface Discipline {
+  available: boolean; reason?: string;
+  planned?: DisciplineBucket; unplanned?: DisciplineBucket; untagged?: DisciplineBucket;
+  execution_rate?: number | null;
+  /** 最狠的一张账：只做按计划的交易，账户会是什么样 */
+  what_if_only_planned?: {
+    actual_net: number | null; planned_only_net: number | null;
+    cost_of_indiscipline: number | null;
+  };
+  note?: string;
+}
+export interface Equity {
+  available: boolean; reason?: string;
+  points?: EquityPoint[]; trades?: number;
+  net_pnl?: number; peak?: number; peak_date?: string | null;
+  current_drawdown?: number; max_drawdown?: number; max_drawdown_since?: string | null;
+  /** 已多少笔没创新高 —— "手感还在不在"的直接读数 */
+  trades_since_peak?: number; longest_underwater?: number;
+  win_rate?: number; avg_win?: number | null; avg_loss?: number | null;
+  payoff_ratio?: number | null; profit_factor?: number | null;
+  worst_losing_streak?: number; worst_trade?: number;
+  /** 去掉最好的几笔之后还剩多少 —— 最能揭穿"其实靠一两笔运气" */
+  net_without_best1?: number; net_without_best3?: number;
+  best_trade_share?: number | null;
+}
+export interface InboxFlag { key: string; text: string }
+export interface Violations {
+  available: boolean; reason?: string;
+  rules?: Record<string, number>; is_default_rules?: boolean;
+  violations?: Violation[]; violation_count?: number;
+  after_loss_streak?: {
+    threshold: number; trades: number; avg_pct: number | null; win_rate: number | null;
+  };
+}
+export interface DisciplineBucket {
+  count: number; win_rate: number | null; avg_pct: number | null; net_pnl: number | null;
+}
+export interface EquityPoint { date: string; cum_pnl: number; pnl: number; drawdown: number; }
+export interface ArchiveDrift {
+  slug: string; days: number; changed: boolean; note: string;
+  versions?: { since: string; fields: string[] }[];
+}
+export interface ArchiveSummary {
+  available: boolean; days?: number;
+  date_from?: string | null; date_to?: string | null; size_mb?: number;
+  datasets?: Record<string, number>;
+  drift?: Record<string, ArchiveDrift>;
+}
+export interface BacktestData {
+  available: boolean;
+  reason?: string;
+  days_requested?: number;
+  days_used?: number;
+  date_from?: string;
+  date_to?: string;
+  /** 取数失败被剔除的交易日——不静默截断 */
+  missing_days?: string[];
+  /** 已囤语料规模：回测窗口的真实上限，随每次复盘自动增长 */
+  corpus?: { days: number; from: string | null; to: string | null };
+  /** 首板按封板时间分档的收益曲线——回答「封板时间到底值多少钱」 */
+  seal_curve?: ({ bucket: string } & BacktestStats)[];
+  strategies?: Record<string, BacktestStrategy>;
+  generated_at?: string;
+  stale?: boolean;
+  warnings?: string[];
+}
+export interface BacktestDay {
+  date: string; sample: number; avg: number | null; regime: string; equity: number;
+}
+export interface BacktestStats {
+  sample: number;
+  win_rate: number | null;
+  avg: number | null;
+  median: number | null;
+  best: number | null;
+  worst: number | null;
+  limit_up_rate: number | null;
+}
+export interface DriftMetric {
+  metric: string; label: string; kind: string;
+  recent: number; prior: number; delta: number;
+  rel_change: number | null; shifted: boolean;
+}
+export interface DriftReport {
+  available: boolean;
+  field_drift?: Record<string, ArchiveDrift>; field_changed?: string[];
+  structure?: {
+    available: boolean; reason?: string;
+    recent_window?: { days: number; from: string; to: string };
+    prior_window?: { days: number; from: string; to: string };
+    metrics?: DriftMetric[]; shifted_count?: number; note?: string;
+  };
+  regime_events?: { date: string; title: string; note?: string }[];
+  regime_note?: string; summary?: string;
+}
+export interface BacktestStrategy {
+  desc: string;
+  overall: BacktestStats;
+  /** 分情绪环境：情绪强 / 情绪中 / 情绪弱 */
+  by_regime: Record<string, BacktestStats>;
+  daily: BacktestDay[];
+  final_equity: number;
+}
+export interface DeepDiveData {
+  code?: string;
+  name?: string;
+  trade_date?: string;
+  generated_at?: string;
+  verdict: StockVerdict | null;
+  verdict_md?: string;
+  reports?: { theme: string; capital: string; technical: string; risk: string };
+  debate?: { join: string; avoid: string };
+}
+export interface StockVerdict {
+  /** 仅部分 prompt 包会产出参与倾向（自带的 research 包只给客观画像）——渲染时必须判空 */
+  stance?: string;
+  one_liner: string;
+  theme: string;
+  capital: string;
+  technical: string;
+  /** 同上，可能不存在 */
+  watch_points?: string[];
+  risks: string[];
+  debate_takeaway: string;
+}
+
+// ---------- 当前持仓（positions.py：从交易日志聚合，不另存一份账）----------
+export interface PositionRow {
+  code: string; name: string; shares: number; cost: number;
+  price: number | null;
+  quote_ok: boolean;              // ⚠️ false = 行情取不到，不是价格为 0
+  cost_amount: number;
+  market_value: number | null;
+  pnl: number | null;
+  pnl_pct: number | null;
+  planned_stop: number | null;
+  playbooks: string[];
+  trade_ids: string[];
+}
+export interface PositionsReport {
+  available: boolean;
+  reason?: string;
+  holdings: PositionRow[];
+  stale_count?: number;
+  total?: {
+    market_value: number; cost: number; pnl: number; pnl_pct: number | null;
+    complete: boolean; counted: number; of: number;
+  } | null;
+  note?: string;
+}

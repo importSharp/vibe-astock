@@ -28,7 +28,15 @@ def _clean_reason(text: str, max_tags: int = 4, max_len: int = 40) -> str:
 
 
 def _fetch_reasons(date: str) -> tuple[dict, str | None]:
-    """问财拉当日涨停原因，返回 ({6位代码: 题材串}, 错误说明或 None)。"""
+    """问财拉**指定交易日**的涨停原因，返回 ({6位代码: 题材串}, 错误说明或 None)。
+
+    ⚠️ 查询必须带上日期。写成"今日涨停的股票"有两个问题：
+    ① 涨停池会往前回退到最近有数据的交易日（周末、节假日、当天接口短暂失败），
+       这时"今日"取回来的原因和池子不是同一天，拼在一起看着完全正常；
+    ② 实测收盘当天"今日"这个词本身就常常返回 0 行，而带日期的查询正常有数据 ——
+       写死"今日"会让题材串整体为空。
+    返回的列名形如 `涨停原因[20260828]`，下面按子串匹配，不要改成精确等于。
+    """
     if not os.environ.get("IWENCAI_API_KEY"):
         return {}, "未配置 IWENCAI_API_KEY，涨停原因暂缺"
     try:
@@ -41,7 +49,7 @@ def _fetch_reasons(date: str) -> tuple[dict, str | None]:
     reasons: dict[str, str] = {}
     try:
         for page in range(1, 4):  # 单页 50，涨停一般 1~3 页
-            df = client.query("今日涨停的股票 涨停原因", page=page, limit=50)
+            df = client.query(f"{date}涨停的股票 涨停原因", page=page, limit=50)
             if df is None or len(df) == 0:
                 break
             code_cols = [c for c in df.columns if "代码" in c]

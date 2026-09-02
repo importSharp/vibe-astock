@@ -27,6 +27,7 @@ from typing import Any, Callable
 from pydantic import BaseModel
 
 from . import schemas
+from .deepdive import schemas as dd_schemas
 
 _LOCAL_PACK_PATH = Path.home() / ".vibe-astock" / "prompts_local.py"
 
@@ -48,6 +49,23 @@ class PromptPack:
         "不给参与倾向（能不能买/值不值得参与/谁更稳）、不给买卖点位或时机、不做品种推荐。"
         "上面没覆盖的就说没覆盖，别编。"
     )
+    # 个股深挖（按需跑的单股 agent）的口径。⚠️ 与 chat_guidance 同理，**必须带默认值**：
+    # 用户的本地包多半是在这几条字段加进来之前写的，不给默认值会让它构造 PromptPack 时
+    # 因缺参报错 → 静默回退默认包（表现是"跑起来了但口径全变了"，最难发现）。
+    deepdive_style: str = (
+        "基于数据讲清楚这只标的当前是什么状态、依据是什么。"
+        "只作客观描述与风险披露，不给参与倾向、不给买卖点位。"
+    )
+    deepdive_requirements: str = """1. 一句话概括这只标的当前的客观状态。
+2. 题材归属与它和当前市场主线的关系。
+3. 资金面状态（龙虎榜/量能/主力动向）。
+4. 技术位置（所处区间、形态、连板情况）。
+5. 需要披露的风险点。
+6. 总结正反两方的核心分歧。
+⚠️ 只做事实描述与风险披露：不给参与倾向（值得关注/回避之类）、不给关注点位或买卖时机。"""
+    verdict_model: type[BaseModel] = dd_schemas.StockProfile   # 个股结论 schema
+    verdict_skeleton: str = dd_schemas.PROFILE_SKELETON
+    render_verdict: Callable[[Any], str] = dd_schemas.render_profile
 
 
 RESEARCH_PACK = PromptPack(

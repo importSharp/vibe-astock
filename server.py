@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 import uuid
+from contextlib import asynccontextmanager
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -21,6 +22,7 @@ from duanxian import live_emotion, overseas, preflight, reflection, review_store
 from duanxian.review_store import md_to_html as _md_to_html, strip_prefix as _strip_prefix
 from duanxian.config import make_llm
 from duanxian.review_graph import build_review_graph
+from duanxian.deepdive.graph import run as deepdive_run
 from duanxian.roles import ROLES
 from main import initial_state
 from duanxian.util import (
@@ -35,6 +37,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 # 构建：cd frontend && npm run build
 _DIST = os.path.join(_HERE, "frontend", "dist")
 _REVIEW_DIR = os.path.expanduser("~/.duanxian-agents/reviews")
+_DD_DIR = os.path.expanduser("~/.duanxian-agents/deepdive")
 _WK_DIR = os.path.expanduser("~/.duanxian-agents/weekly")
 os.makedirs(_REVIEW_DIR, exist_ok=True)
 os.makedirs(_WK_DIR, exist_ok=True)
@@ -293,8 +296,13 @@ _job = {
     "running": False, "job_id": None, "date": None, "error": None,
     "started": None, "elapsed": 0, "finished_at": None,
 }
+_dd_job = {
+    "running": False, "job_id": None, "stock": None, "error": None,
+    "started": None, "elapsed": 0, "finished_at": None,
+}
 
 _JOB_TIMEOUT = 15 * 60
+_DD_TIMEOUT = 10 * 60
 
 
 def _job_stuck(job: dict, limit: int) -> bool:
@@ -322,6 +330,41 @@ def _capture_theme_reasons() -> None:
             print(f"⚠️ 题材串囤积失败（{r.get('date')}）：{r.get('reason')}")
     except Exception as exc:  # noqa: BLE001
         print(f"⚠️ 题材串囤积异常：{type(exc).__name__}: {exc}")
+
+
+def _capture_archive(date: str) -> None:
+    """把**被复盘那一天**的原始数据整套永久归档 —— 日后还能按新口径重算的唯一依据。
+
+    ⚠️ 必须把 `date` 传下去：补跑历史某天的复盘时不传参，归档的会是"最近交易日"，
+       而目标历史日照样缺失 —— 归档看着照常成功，缺口却一直在。
+    """
+    try:
+        from duanxian import archive
+
+        r = archive.capture_day(date)
+        if not r.get("ok"):
+            print(f"⚠️ 原始数据归档失败（{r.get('date')}）：{r.get('reason')}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"⚠️ 原始数据归档异常：{type(exc).__name__}: {exc}")
+
+
+def _capture_backtest_corpus(date: str) -> None:
+    """顺手把**被复盘那一天**的回测语料囤下来（1 次请求）。
+
+    ⚠️ 数据源只留最近约 15 个交易日，**过期不候** —— 没在窗口期内抓下来的日子
+    就永久缺失。挂在复盘完成之后，语料随日子推移自己长长，回测窗口就不再受
+    数据源留存限制。失败只记日志，绝不影响复盘本身。
+    """
+    try:
+        from duanxian.backtest import capture
+
+        r = capture(date)
+        if not r.get("ok"):
+            print(f"⚠️ 回测语料捕获失败（{r.get('date')}）：{r.get('reason')}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"⚠️ 回测语料捕获异常：{type(exc).__name__}: {exc}")
+
+
 def _run_review(date: str, job_id: str) -> None:
     try:
         # 先体检输入 —— 核心数据取不到就别跑。喂空数据进去，模型会硬凑出
@@ -340,6 +383,8 @@ def _run_review(date: str, job_id: str) -> None:
             # 产物不可用 → 必须让用户看见，不能"任务成功但内容是空的"
             raise RuntimeError(res.reason)
         _capture_theme_reasons()     # 题材串同理（问财只给最近交易日）
+        _capture_archive(date)           # 原始数据永久归档（零额外请求，走已有缓存）
+        _capture_backtest_corpus(date)   # 复盘写完再囤语料，失败也不影响已产出的复盘
     except Exception as exc:  # noqa: BLE001
         with _lock:
             if _job["job_id"] == job_id:
@@ -770,6 +815,718 @@ def api_verify_save(request: Request, date: str, body: dict = Body(...)):
         return JSONResponse({"error": str(exc)}, status_code=400)
     except RuntimeError as exc:
         return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+# ==================== ④ 交易日志与模式卡 ====================
+# ⛔ 本段的数据全部是使用者自己录入的个人交易记录，**不接入任何 AI prompt**。
+
+
+@app.get("/api/journal/list")
+def api_journal_list(limit: int = 200):
+    from duanxian import journal
+
+    try:
+        return JSONResponse(journal.list_trades(max(1, min(limit, 1000))))
+    except journal.JournalCorrupted as exc:
+        # ⚠️ 账本损坏必须报 500 并说明原因，绝不返回空表 —— 空表会被读成
+        #    "记录丢了"，而下一次写入就真的把它覆盖掉了。
+        return JSONResponse({"error": str(exc), "corrupted": True}, status_code=500)
+
+
+@app.get("/api/journal/stats")
+def api_journal_stats():
+    from duanxian import journal
+
+    try:
+        return JSONResponse(journal.stats())
+    except journal.JournalCorrupted as exc:
+        return JSONResponse({"error": str(exc), "corrupted": True}, status_code=500)
+
+
+@app.post("/api/journal/add")
+def api_journal_add(request: Request, body: dict = Body(...)):
+    if not _origin_ok(request):
+        return JSONResponse({"error": "非法来源"}, status_code=403)
+    from duanxian import journal
+
+    try:
+        pnl = body.get("pnl_pct")
+        return JSONResponse(journal.add_trade(
+            date=str(body.get("date") or "").strip(),
+            code=str(body.get("code") or "").strip(),
+            name=str(body.get("name") or "").strip(),
+            playbook=str(body.get("playbook") or "其它").strip(),
+            pnl_pct=None if pnl in (None, "") else float(pnl),
+            as_planned=body.get("as_planned"),
+            note=str(body.get("note") or ""),
+            # ⚠️ 每个字段都必须透传。漏掉 fills 会让界面上填的成交明细被静默丢弃，
+            #    且前端不报错 —— 而加权成本、已实现盈亏、持有天数全靠它算。
+            fills=body.get("fills") or [],
+            planned_stop=body.get("planned_stop"),
+            planned_target=body.get("planned_target"),
+        ))
+    except (ValueError, TypeError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except journal.JournalCorrupted as exc:
+        return JSONResponse({"error": str(exc), "corrupted": True}, status_code=500)
+    except RuntimeError as exc:      # 写盘失败 —— 必须让用户知道这一笔没记上
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.post("/api/journal/update")
+def api_journal_update(request: Request, trade_id: str, body: dict = Body(...)):
+    """更新一笔已有交易 —— 主要用来给持仓中的记录**补上后来的成交**。
+
+    只处理请求里出现的字段，其余保持不变。没有这个接口时，补一笔卖出只能
+    删掉重录，`created_at` 与"下单时写下的计划边界"这个证据就一起没了。
+    """
+    if not _origin_ok(request):
+        return JSONResponse({"error": "非法来源"}, status_code=403)
+    from duanxian import journal
+
+    kw = {}
+    if "fills" in body:
+        kw["fills"] = body.get("fills") or []
+    if "note" in body:
+        kw["note"] = str(body.get("note") or "")
+    for k in ("as_planned", "planned_stop", "planned_target"):
+        if k in body:                      # ⚠️ 用 in 判断：没传 = 不动，传了 null = 清空
+            kw[k] = body[k]
+    try:
+        r = journal.update_trade(trade_id, **kw)
+        if not r.get("ok"):
+            return JSONResponse({"error": r.get("reason") or "更新失败"}, status_code=404)
+        return JSONResponse(r)
+    except (ValueError, TypeError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except journal.JournalCorrupted as exc:
+        return JSONResponse({"error": str(exc), "corrupted": True}, status_code=500)
+    except RuntimeError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.get("/api/positions")
+def api_positions():
+    """当前持仓 —— 从交易日志的成交明细聚合，**不另存一份账**。
+
+    ⚠️ 与 `vr` 的 `/api/portfolio` 是两套不同的账：那一套自己存 holdings，
+    需要重复录入且和日志对不上。新界面一律走这个口，`/api/portfolio` 保留
+    只为兼容旧数据（`vr/` 是上游逐字副本，不在这里改它）。
+    """
+    from duanxian import journal, positions
+
+    try:
+        return JSONResponse(positions.report())
+    except journal.JournalCorrupted as exc:
+        return JSONResponse({"error": str(exc), "corrupted": True}, status_code=500)
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"available": False,
+                             "reason": f"{type(exc).__name__}: {exc}"}, status_code=200)
+
+
+@app.post("/api/positions/import-legacy")
+def api_positions_import(request: Request):
+    """把旧的 `vr` 持仓（`~/.vibe-research/portfolio.json`）一次性导入交易日志。
+
+    ⚠️ 只导**当前持仓**，每条建成一笔"只有买入、尚未卖出"的交易。
+    旧记录里没有成交日期，用 `date` 字段或今天，并在备注里注明是导入的 ——
+    不伪造一个看起来精确的建仓日。已导过的（同代码同股数同成本）跳过，可重复调用。
+    """
+    if not _origin_ok(request):
+        return JSONResponse({"error": "非法来源"}, status_code=403)
+    from duanxian import journal, positions
+
+    try:
+        import portfolio as vr_pf  # noqa: PLC0415  vr/ 已在 sys.path
+
+        legacy = (vr_pf.load() or {}).get("holdings") or []
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"error": f"读不到旧持仓：{type(exc).__name__}: {exc}"},
+                            status_code=500)
+    if not legacy:
+        return JSONResponse({"ok": True, "imported": 0, "skipped": 0,
+                             "message": "旧持仓是空的，没有需要导入的内容"})
+
+    existing = {(p["code"], p["shares"], p["cost"]) for p in positions.open_positions()}
+    imported = skipped = 0
+    errors = []
+    for h in legacy:
+        code = str(h.get("code") or "").zfill(6)
+        shares, cost = float(h.get("shares") or 0), float(h.get("cost") or 0)
+        if not code or shares <= 0 or cost <= 0:
+            errors.append(f"{code or '(空代码)'}：股数或成本不可用，跳过")
+            continue
+        if (code, round(shares, 2), round(cost, 4)) in existing:
+            skipped += 1
+            continue
+        day = str(h.get("date") or "").strip() or china_today()
+        try:
+            journal.add_trade(
+                date=day, code=code, name=str(h.get("name") or ""), playbook="其它",
+                note="由旧持仓导入（原记录没有成交明细，建仓日期可能不准）",
+                fills=[{"side": "buy", "date": day, "price": cost, "shares": shares}])
+            imported += 1
+        except (ValueError, TypeError) as exc:
+            errors.append(f"{code}：{exc}")
+    return JSONResponse({"ok": True, "imported": imported, "skipped": skipped,
+                         "errors": errors})
+
+
+@app.get("/api/journal/fees")
+def api_journal_fees():
+    from duanxian import journal
+
+    return JSONResponse({"fees": journal.load_fees(), "labels": journal._FEE_LABELS,
+                         "defaults": journal.DEFAULT_FEES})
+
+
+@app.post("/api/journal/fees")
+def api_journal_save_fees(request: Request, body: dict = Body(...)):
+    """保存**使用者自己的**费率。默认值只是能跑起来的初值，不是推荐值。"""
+    if not _origin_ok(request):
+        return JSONResponse({"error": "非法来源"}, status_code=403)
+    from duanxian import journal
+
+    try:
+        return JSONResponse(journal.save_fees(body.get("fees") or {}))
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except RuntimeError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.post("/api/journal/delete")
+def api_journal_delete(request: Request, trade_id: str):
+    if not _origin_ok(request):
+        return JSONResponse({"error": "非法来源"}, status_code=403)
+    from duanxian import journal
+
+    try:
+        return JSONResponse(journal.delete_trade(trade_id))
+    except (journal.JournalCorrupted, RuntimeError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.get("/api/modes")
+def api_modes():
+    """模式卡列表 + 按版本分段的业绩。"""
+    from duanxian import modes
+
+    try:
+        return JSONResponse({**modes.list_cards(), "performance": modes.performance()})
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"error": f"{type(exc).__name__}: {exc}"}, status_code=500)
+
+
+@app.post("/api/modes")
+def api_save_mode(request: Request, body: dict = Body(...)):
+    if not _origin_ok(request):
+        return JSONResponse({"error": "非法来源"}, status_code=403)
+    from duanxian import modes
+
+    try:
+        return JSONResponse(modes.save_card(body or {}))
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except RuntimeError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.post("/api/modes/delete")
+def api_delete_mode(request: Request, body: dict = Body(...)):
+    if not _origin_ok(request):
+        return JSONResponse({"error": "非法来源"}, status_code=403)
+    from duanxian import modes
+
+    try:
+        return JSONResponse(modes.delete_card(str(body.get("id") or "")))
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except RuntimeError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+# ==================== ⑤ 账户风险与执行偏差 ====================
+# ⛔ 与 ④ 同：这一段读的全是使用者自己录入的交易数据，**不接入任何 AI prompt**。
+
+
+@app.get("/api/risk/report")
+def api_risk_report():
+    from duanxian import journal, risk
+
+    try:
+        return JSONResponse(risk.report())
+    except journal.JournalCorrupted as exc:
+        return JSONResponse({"error": str(exc), "corrupted": True}, status_code=500)
+
+
+@app.get("/api/risk/attribution")
+def api_risk_attribution():
+    """判断 vs 执行归因四格。看对了却亏钱 = 执行问题；看错了还赚钱 = 运气。"""
+    from duanxian import attribution, journal
+
+    try:
+        return JSONResponse(attribution.attribution())
+    except journal.JournalCorrupted as exc:
+        return JSONResponse({"error": str(exc), "corrupted": True}, status_code=500)
+
+
+@app.get("/api/risk/excursion")
+def api_risk_excursion():
+    """MFE/MAE 与盈利回吐。
+
+    ⚠️ 逐笔要拉历史行情（已永久缓存，首次会慢）→ **单独端点，不塞进 /risk/report**，
+    否则每次打开交易日志页都要干等一轮网络。
+    """
+    from duanxian import excursion, journal
+
+    try:
+        return JSONResponse(excursion.summary())
+    except journal.JournalCorrupted as exc:
+        return JSONResponse({"error": str(exc), "corrupted": True}, status_code=500)
+
+
+@app.get("/api/risk/at-risk")
+def api_at_risk():
+    """在险资金：现在这些仓位最坏会亏掉多少（按用户自己写下的计划止损算）。"""
+    from duanxian import at_risk, journal
+
+    try:
+        return JSONResponse(at_risk.report())
+    except journal.JournalCorrupted as exc:
+        return JSONResponse({"error": str(exc), "corrupted": True}, status_code=500)
+
+
+@app.get("/api/risk/equity-base")
+def api_get_equity_base():
+    from duanxian import at_risk
+
+    return JSONResponse({"equity_base": at_risk.load_equity_base()})
+
+
+@app.post("/api/risk/equity-base")
+def api_set_equity_base(request: Request, body: dict = Body(...)):
+    if not _origin_ok(request):
+        return JSONResponse({"error": "非法来源"}, status_code=403)
+    from duanxian import at_risk
+
+    try:
+        return JSONResponse(at_risk.save_equity_base(body.get("equity_base")))
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except RuntimeError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.get("/api/risk/inbox")
+def api_inbox():
+    """异常交易收件箱：值得回头看一眼的那几笔（判定基准全来自用户自己）。"""
+    from duanxian import inbox, journal
+
+    try:
+        return JSONResponse(inbox.build())
+    except journal.JournalCorrupted as exc:
+        return JSONResponse({"error": str(exc), "corrupted": True}, status_code=500)
+
+
+@app.get("/api/risk/rules")
+def api_risk_rules():
+    from duanxian import risk
+
+    return JSONResponse({"rules": risk.load_rules(), "labels": risk._RULE_LABELS,
+                         "defaults": risk.DEFAULT_RULES})
+
+
+@app.post("/api/risk/rules")
+def api_risk_save_rules(request: Request, body: dict = Body(...)):
+    """保存**用户自己的**风险宪法。系统只监控他有没有违反自己定的规矩。"""
+    if not _origin_ok(request):
+        return JSONResponse({"error": "非法来源"}, status_code=403)
+    from duanxian import risk
+
+    try:
+        return JSONResponse(risk.save_rules(body.get("rules") or {}))
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except RuntimeError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+# ==================== ⑥ 原始数据归档 · 结构漂移 · 策略回测 ====================
+
+@app.get("/api/archive/summary")
+def api_archive_summary():
+    """原始数据归档总览：囤了多久、多大、字段有没有漂移过。"""
+    from duanxian import archive
+
+    return JSONResponse(archive.summary())
+
+
+
+
+# ========== 第二段：个人交易日志 ==========
+
+# ==================== 个人交易日志 ====================
+# ⚠️ 只统计用户自己录入的历史行为，**不产出任何下一笔建议**。
+# 它是记账本 + 体检报告，不是参谋：不选股、不给买卖时机、不给参与倾向。
+
+
+@app.get("/api/drift")
+def api_drift():
+    """结构漂移：数据源字段 + 市场结构 + 已登记的制度事件。"""
+    from duanxian import drift
+
+    return JSONResponse(drift.report())
+
+
+@app.get("/api/drift/calendar")
+def api_get_regime_calendar():
+    from duanxian import drift
+
+    return JSONResponse({"events": drift.load_calendar()})
+
+
+@app.post("/api/drift/calendar")
+def api_save_regime_calendar(request: Request, body: dict = Body(...)):
+    if not _origin_ok(request):
+        return JSONResponse({"error": "非法来源"}, status_code=403)
+    from duanxian import drift
+
+    try:
+        return JSONResponse(drift.save_calendar(body.get("events") or []))
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except RuntimeError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+# ---------------------------------------------------------------- 策略回测
+_bt_lock = threading.Lock()
+
+
+def _bt_path(days: int) -> str:
+    """回测结果缓存路径 —— 与 backtest.prior_context 读的是同一份，别两处各写一份。"""
+    from duanxian.backtest import result_path
+
+    return result_path(days)
+
+
+def _bt_load(days: int) -> Optional[dict]:
+    """读回测缓存。走 backtest.load_result —— 它会连**策略集是否变过**一起校验。"""
+    from duanxian.backtest import load_result
+
+    return load_result(days)
+
+
+def _bt_fresh(cached: dict) -> bool:
+    """缓存是否覆盖到最新已收盘交易日。判不了（网络失败）→ 按新鲜处理，不硬刷。
+
+    ⚠️ 必须用 `latest_session()` 而不是裸的 `last_trade_dates(1)`：腾讯 hist 收盘后
+    有延迟，后者会返回上一个交易日，导致当天的缓存永远判成过期、每次请求重算。
+    """
+    try:
+        from duanxian.trade_calendar import latest_session
+
+        expected = latest_session()
+    except Exception:  # noqa: BLE001
+        expected = None
+    return expected is None or cached.get("date_to") == expected
+
+
+@app.get("/api/backtest")
+def api_backtest(request: Request, days: int = 60, refresh: int = 0):
+    """短线策略回测。首次约 1-2 分钟（逐日取数），历史结果落盘缓存后很快。
+
+    ⚠️ 产出是「规则的历史统计」，不是前瞻标的。
+    ⚠️ 强制刷新走 POST `/api/backtest/refresh`，原因见 `api_weekly`。
+    """
+    from duanxian.backtest import run_backtest
+
+    if refresh and not _origin_ok(request):
+        return JSONResponse({"error": "非法来源"}, status_code=403)
+    force = bool(refresh) and _origin_ok(request)
+
+    days = max(10, min(int(days or 60), 120))   # 夹在合理区间，防误传
+    cached = _bt_load(days)
+    if not force and cached and cached.get("available") and _bt_fresh(cached):
+        return JSONResponse(cached)
+
+    # 非阻塞取锁：正在算就回缓存 + busy，不让请求线程干等一两分钟
+    if not _bt_lock.acquire(blocking=False):
+        if cached and cached.get("available"):
+            return JSONResponse({**cached, "busy": True})
+        return JSONResponse({"error": "正在回测中，请稍后重试", "busy": True}, status_code=409)
+    try:
+        cached2 = _bt_load(days)
+        if not force and cached2 and cached2.get("available") and _bt_fresh(cached2):
+            return JSONResponse(cached2)
+        bt = run_backtest(days)
+        bt["generated_at"] = china_now().strftime("%Y-%m-%d %H:%M")
+        if bt.get("available"):
+            try:
+                _atomic_write(_bt_path(days), bt)
+            except Exception as exc:  # noqa: BLE001  写缓存失败不该拖垮响应，但必须出声
+                print(f"⚠️ 回测缓存写入失败（每次请求都会重算）：{type(exc).__name__}: {exc}")
+            return JSONResponse(bt)
+        # 算失败：不覆盖有效缓存，尽量返回上一份 + stale 标记
+        if cached2 and cached2.get("available"):
+            stale = dict(cached2)
+            stale["stale"] = True
+            stale["warnings"] = (stale.get("warnings") or []) + ["刷新失败，展示上一份有效数据"]
+            return JSONResponse(stale)
+        return JSONResponse(bt)
+    finally:
+        _bt_lock.release()
+
+
+@app.post("/api/backtest/refresh")
+def api_backtest_refresh(request: Request, days: int = 60):
+    """强制重跑回测。写操作走 POST + Origin 校验（见 api_weekly 的说明）。"""
+    if not _origin_ok(request):
+        return JSONResponse({"error": "非法来源"}, status_code=403)
+    return api_backtest(request, days=days, refresh=1)
+
+
+# ==================== 主线 B：个股深挖 ====================
+def _serialize_dd(final: dict) -> dict:
+    ds = final.get("debate_state", {}) or {}
+    now = china_now().strftime("%Y-%m-%d %H:%M") + " CST"
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "run_type": "stock_deepdive",
+        "code": final.get("code", ""),
+        "name": final.get("name", ""),
+        "trade_date": final.get("trade_date", ""),
+        "generated_at": now,
+        "verdict": final.get("verdict_struct"),
+        "verdict_md": final.get("verdict", ""),
+        "reports": {
+            "theme": _md_to_html(final.get("theme_report", "")),
+            "capital": _md_to_html(final.get("capital_report", "")),
+            "technical": _md_to_html(final.get("technical_report", "")),
+            "risk": _md_to_html(final.get("risk_report", "")),
+        },
+        "debate": {
+            "join": _md_to_html(_strip_prefix(ds.get("join_history", ""), "参与派:")),
+            "avoid": _md_to_html(_strip_prefix(ds.get("avoid_history", ""), "回避派:")),
+        },
+    }
+
+
+def _run_dd(stock: str, job_id: str) -> None:
+    error = None
+    try:
+        final = deepdive_run(stock)
+        if final.get("error"):
+            error = final["error"]
+        else:
+            payload = _serialize_dd(final)
+            _atomic_write(safe_join(_DD_DIR, "latest.json"), payload)
+            if payload.get("code"):
+                _atomic_write(safe_join(_DD_DIR, f"{payload['code']}.json"), payload)
+    except Exception as exc:  # noqa: BLE001
+        error = f"{type(exc).__name__}: {exc}"
+    finally:
+        with _lock:
+            if _dd_job["job_id"] == job_id:
+                _dd_job["running"] = False
+                _dd_job["error"] = error
+                if _dd_job["started"]:
+                    _dd_job["elapsed"] = int(time.time() - _dd_job["started"])
+                _dd_job["finished_at"] = china_now().strftime("%Y-%m-%d %H:%M:%S") + " CST"
+
+
+@app.post("/api/deepdive/run")
+def api_dd_run(request: Request, stock: str):
+    if not _origin_ok(request):
+        return JSONResponse({"error": "非法来源"}, status_code=403)
+    stock = (stock or "").strip()
+    if not stock:
+        return JSONResponse({"error": "缺 stock 参数（6 位代码或简称）"}, status_code=400)
+    with _lock:
+        if _dd_job["running"] and not _job_stuck(_dd_job, _DD_TIMEOUT):
+            # 繁忙：明确告知当前占用的是哪只票，前端据此不误加载别人的结果
+            return {"running": True, "busy": True, "stock": _dd_job["stock"]}
+        if _dd_job["running"]:   # 卡死的旧任务让位（同 api_run，见 _job_stuck）
+            _dd_job["error"] = (f"上一次深挖（{_dd_job.get('stock')}）超过 "
+                                f"{_DD_TIMEOUT // 60} 分钟无响应，已判为卡死")
+        job_id = uuid.uuid4().hex
+        _dd_job.update(running=True, job_id=job_id, stock=stock, error=None,
+                       started=time.time(), elapsed=0, finished_at=None)
+    threading.Thread(target=_run_dd, args=(stock, job_id), daemon=True).start()
+    return {"running": True, "busy": False, "stock": stock, "job_id": job_id}
+
+
+@app.get("/api/deepdive/status")
+def api_dd_status():
+    with _lock:
+        snap = dict(_dd_job)
+    if snap["running"] and snap["started"]:
+        snap["elapsed"] = int(time.time() - snap["started"])
+    snap.pop("started", None)
+    return snap
+
+
+@app.get("/api/deepdive/latest")
+def api_dd_latest():
+    path = os.path.join(_DD_DIR, "latest.json")
+    if not os.path.exists(path):
+        return JSONResponse({}, status_code=200)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return JSONResponse(json.load(fh))
+    except (json.JSONDecodeError, OSError):
+        return JSONResponse({}, status_code=200)
+
+
+def _deepdive_context() -> str:
+    d = _load_latest_json(_DD_DIR)
+    if not d:
+        return "（暂无个股深挖数据，请先在个股深挖 Agent 深挖一只票。）"
+    parts = [f"标的 {d.get('name', '')}（{d.get('code', '')}）", f"【深挖结论】\n{d.get('verdict_md', '')}"]
+    r = d.get("reports", {}) or {}
+    for k, t in [("theme", "题材归属"), ("capital", "资金流向"), ("technical", "技术形态"), ("risk", "风险排查")]:
+        if r.get(k):
+            parts.append(f"【{t}】\n{_strip_html(r[k])}")
+    return "\n\n".join(parts)[:8000]
+
+
+@app.post("/api/deepdive/chat")
+def api_dd_chat(request: Request, body: dict = Body(...)):
+    if not _origin_ok(request):
+        return JSONResponse({"error": "非法来源"}, status_code=403)
+    msgs, err = _sanitize_messages(body.get("messages"))
+    if err:
+        return JSONResponse({"error": err}, status_code=400)
+    return _chat(_deepdive_context(), "A 股短线个股深挖助手", msgs)
+
+
+# ==================== 盘中快照 / 竞价核验 ====================
+# ⚠️ 盘中快照**过了那个点就永远没有了**（拿的是实时行情），所以要后台按点自动抓，
+# 不能等有人想起来点一下。⚠️ 调度一律按**上海时区**判断，不用本机时区 ——
+#    机器在别的时区时，用本机时间会整天抓不到任何一个时点，而界面上看不出异样。
+_intraday_thread_started = False
+_intraday_start_lock = threading.Lock()
+
+
+def _intraday_scheduler() -> None:
+    """按 SNAPSHOT_SLOTS 定时抓盘面快照。交易日之外空转。
+
+    ⚠️ 导入放在循环内的 try 里：放在函数开头（try 之外）的话，任一导入失败会让线程
+       **当场退出**，而 `_intraday_thread_started` 已经是 True、不会再重启，
+       循环里的异常日志也永远打不出来 —— 表现是"快照整天没抓，日志里一个字都没有"。
+    """
+    done: set[str] = set()
+    last_day = None
+    while True:
+        try:
+            from duanxian import intraday
+            from duanxian.util import china_now, china_today, is_weekend
+
+            today = china_today()
+            if last_day is None:
+                last_day = today
+            if today != last_day:      # 跨天清账
+                done.clear()
+                last_day = today
+            if not is_weekend(today):
+                hhmm = china_now().strftime("%H:%M")
+                for slot in intraday.SNAPSHOT_SLOTS:
+                    key = f"{today}#{slot}"
+                    # 到点后 6 分钟内补抓（进程刚起或调度稍晚也不漏）
+                    if key not in done and slot <= hhmm <= _plus_minutes(slot, 6):
+                        r = intraday.capture(slot, today)
+                        # ⚠️ **只有成功才标完成**：无条件标记会让某个时点第一次碰上
+                        #    数据源未更新或瞬时超时就被永久放弃，白白浪费后面的重试窗口。
+                        if r.get("ok"):
+                            done.add(key)
+                        else:
+                            print(f"⚠️ 盘中快照 {slot} 失败（窗口内会重试）：{r.get('reason')}")
+                        break
+        except Exception as exc:  # noqa: BLE001  调度线程绝不能死
+            print(f"⚠️ 盘中调度异常：{type(exc).__name__}: {exc}")
+        time.sleep(60)
+
+
+def _plus_minutes(hhmm: str, n: int) -> str:
+    h, m = int(hhmm[:2]), int(hhmm[3:])
+    m += n
+    return f"{(h + m // 60) % 24:02d}:{m % 60:02d}"
+
+
+def _start_intraday() -> None:
+    """启动盘中调度线程。幂等 —— 重复调用不会起第二个。
+
+    ⚠️ 先探一下模块在不在再起线程：不探的话，模块缺失时线程会在后台每轮 ImportError，
+       而**接口全是好的、界面也正常**，只有日志里刷错 —— 典型的"看不出来的坏"。
+    """
+    global _intraday_thread_started
+    with _intraday_start_lock:          # 检查与置位必须在同一把锁里，否则可能起两个线程
+        if _intraday_thread_started:
+            return
+        # ⚠️ 两种失败的异常形态**实测过，不要凭直觉写**（Python 3.12）：
+        #    · 子模块不存在  → ImportError，exc.name == "duanxian"（不是 "duanxian.intraday"），
+        #                      消息形如 "cannot import name 'intraday' from 'duanxian'"
+        #    · 内部依赖缺失  → ModuleNotFoundError，exc.name 是**缺失的那个依赖名**
+        #    照直觉写成「ModuleNotFoundError 且 name == 'duanxian.intraday'」的话，
+        #    兼容分支永远命中不了，而真故障反而被当成兼容情况。
+        try:
+            from duanxian import intraday  # noqa: F401  只探在不在
+        except ModuleNotFoundError as exc:
+            # 走到这里 = intraday 在，但它依赖的东西缺了 —— 真故障，必须出声
+            print(f"⚠️ 盘中调度未启动：intraday 的依赖缺失（{exc}）")
+            return
+        except ImportError as exc:
+            if exc.name == "duanxian" and "intraday" in str(exc):
+                return          # 该版本不含开盘核验，安静跳过
+            print(f"⚠️ 盘中调度未启动：导入 intraday 失败（{type(exc).__name__}: {exc}）")
+            return
+        t = threading.Thread(target=_intraday_scheduler, daemon=True)
+        t.start()
+        _intraday_thread_started = True  # ⚠️ 只在 start() 成功之后才置位
+
+
+# ⚠️ 用 lifespan 不用 @app.on_event（后者已废弃，FastAPI 升级后会静默不执行 →
+# 盘中快照全天不抓，而界面上看不出任何异样）。
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    _start_intraday()
+    yield
+
+
+app.router.lifespan_context = _lifespan
+
+
+@app.get("/api/intraday/auction")
+def api_auction(date: str | None = None):
+    """09:25 竞价核验。没有当日存档时会现抓一张（仅当天有效）。"""
+    from duanxian import intraday
+
+    try:
+        return JSONResponse(intraday.auction_check(date))
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"available": False, "reason": f"{type(exc).__name__}: {exc}"})
+
+
+@app.get("/api/intraday/path")
+def api_intraday_path(date: str | None = None):
+    """当天的情绪路径（各时点快照串成线）。"""
+    from duanxian import intraday
+
+    try:
+        return JSONResponse(intraday.path_summary(date))
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"available": False, "reason": f"{type(exc).__name__}: {exc}"})
+
+
+@app.post("/api/intraday/capture")
+def api_intraday_capture(request: Request, slot: str | None = None):
+    """手动抓一张快照（写操作，走 POST + Origin 校验）。"""
+    if not _origin_ok(request):
+        return JSONResponse({"error": "非法来源"}, status_code=403)
+    from duanxian import intraday
+
+    return JSONResponse(intraday.capture(slot))
 
 
 def _mount_static() -> None:
