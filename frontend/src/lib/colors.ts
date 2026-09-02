@@ -7,6 +7,18 @@ export const DOWN_TEXT = "text-success";
 /** 平/无值 */
 export const FLAT_TEXT = "text-muted-foreground";
 
+/** 涨（正向）用的**背景**色 —— 条形图、色块都走它，别直接写 bg-success/bg-danger。
+ *  ⚠️ 文字用 UP_TEXT、背景用 UP_BG，两者必须同向：曾经条形用绿表示正、
+ *  而同一行的数字用红表示正，一行里两套配色打架，读的人得停下来想一秒。 */
+export const UP_BG = "bg-danger";
+/** 跌（负向）用的背景色 */
+export const DOWN_BG = "bg-success";
+
+export function barColor(v: number | null | undefined): string {
+  if (v == null || Number.isNaN(v)) return "bg-muted";
+  return v > 0 ? UP_BG : v < 0 ? DOWN_BG : "bg-muted";
+}
+
 export function pctColor(v: number | null | undefined): string {
   if (v == null || Number.isNaN(v)) return FLAT_TEXT;
   return v > 0 ? UP_TEXT : v < 0 ? DOWN_TEXT : FLAT_TEXT;

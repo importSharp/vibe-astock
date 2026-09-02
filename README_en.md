@@ -86,6 +86,8 @@ so here is the whole set up front. Chinese terms are given so you can match them
 
 ## Screenshots
 
+### Reading the market
+
 **Review dashboard** — the hard-metric layer, there the moment you open it. Market breadth as the
 denominator, where yesterday's strong names landed today, money effect and loss effect side by side.
 
@@ -96,15 +98,45 @@ tomorrow: every line carries today's baseline and the threshold a move has to cl
 
 <img src="assets/screenshots/02-verification.png" alt="Tomorrow's verification conditions, each with today's baseline and its threshold">
 
+**Limit-up sample stats** — among first-time limit-ups, *when* the seal finally held changes next-day
+expectancy by a wide margin. ⚠️ The sample bias sits pinned at the top of the page: this is a list
+compiled with hindsight about which names sealed, so real expectancy is necessarily lower.
+
+<img src="assets/screenshots/07-backtest.png" alt="Limit-up sample stats: seal-time curve and the sample-bias disclosure">
+
 **Market data** — indices, overnight markets (including the Magnificent Seven), sector money flow,
 turnover ranking, and today's live limit-up sentiment. Auto-refresh optional.
 
 <img src="assets/screenshots/03-market-data.png" alt="Market data: indices and overnight markets">
 
-**5-day heat + leader lineage** — how sentiment moved over five sessions, and how far the leaders
-from a few days ago have fallen since.
+**5-day heat + leader lineage** — how sentiment moved over five sessions, and where the leaders from
+a few days ago have retraced to.
 
 <img src="assets/screenshots/04-heat.png" alt="5-day sentiment heat and leader lineage">
+
+### Reading yourself
+
+> The trades in the next two shots are **sample data**, there only to show the interface.
+> Your own ledger never leaves your machine.
+
+**Trade journal** — every trade is pinned to the market conditions of that day, then grouped for
+self-review by sentiment phase, playbook, whether you followed your plan, board count and holding
+period. Small samples are labelled as such.
+
+<img src="assets/screenshots/05-journal.png" alt="Trade journal: entry form and five-dimension self review">
+
+**Capital at risk** — computed from the stops *you* wrote down, and summed rather than read per
+trade. Positions with no stop are listed separately instead of counted as zero, which is why the
+total is labelled a floor.
+
+<img src="assets/screenshots/06-at-risk.png" alt="Capital at risk: bounded total and positions with no stop">
+
+### On-demand analysis
+
+**Stock deep-dive** — four analysts, a two-sided debate, then a judge. Description and risk
+disclosure only; it never takes a stance on participating.
+
+<img src="assets/screenshots/08-deepdive.png" alt="Stock deep-dive: theme / money flow / technical columns with risk disclosure">
 
 ---
 

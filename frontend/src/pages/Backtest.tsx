@@ -305,11 +305,11 @@ export function Backtest() {
                   {/* 以 0 为中轴，左红右绿 */}
                   <div className="flex flex-1 items-center">
                     <div className="flex h-4 w-1/2 justify-end">
-                      {(b.avg ?? 0) < 0 && <div className="h-full rounded-l bg-danger/70" style={{ width: `${w}%` }} />}
+                      {(b.avg ?? 0) < 0 && <div className="h-full rounded-l bg-success/70" style={{ width: `${w}%` }} />}
                     </div>
                     <div className="h-4 w-px bg-border" />
                     <div className="flex h-4 w-1/2">
-                      {(b.avg ?? 0) > 0 && <div className="h-full rounded-r bg-success/70" style={{ width: `${w}%` }} />}
+                      {(b.avg ?? 0) > 0 && <div className="h-full rounded-r bg-danger/70" style={{ width: `${w}%` }} />}
                     </div>
                   </div>
                   <span className={cn("w-16 shrink-0 text-right font-bold tabular-nums", tone(b.avg))}>{signed(b.avg)}</span>
@@ -338,7 +338,7 @@ export function Backtest() {
                 {isBase && <span className="rounded bg-muted px-2 py-0.5 text-[10px] font-bold text-muted-foreground">基准</span>}
                 {excess != null && (
                   <span className={cn("rounded px-2 py-0.5 text-[10px] font-bold",
-                    excess > 0 ? "bg-success/15 text-success" : "bg-danger/15 text-danger")}>
+                    excess > 0 ? "bg-danger/15 text-danger" : "bg-success/15 text-success")}>
                     超额 {signed(excess)}
                   </span>
                 )}
@@ -386,20 +386,20 @@ export function Backtest() {
                         className="flex flex-1 flex-col justify-center">
                         <div className="flex h-1/2 items-end">
                           {(d.avg ?? 0) > 0 && (
-                            <div className="w-full bg-success/70"
+                            <div className="w-full bg-danger/70"
                               style={{ height: `${Math.min(100, Math.abs(d.avg!) * 10)}%` }} />
                           )}
                         </div>
                         <div className="flex h-1/2 items-start">
                           {(d.avg ?? 0) < 0 && (
-                            <div className="w-full bg-danger/70"
+                            <div className="w-full bg-success/70"
                               style={{ height: `${Math.min(100, Math.abs(d.avg!) * 10)}%` }} />
                           )}
                         </div>
                       </div>
                     ))}
                   </div>
-                  <div className="mt-1 text-[11px] text-muted-foreground/60">逐日均收益（上绿下红）</div>
+                  <div className="mt-1 text-[11px] text-muted-foreground/60">逐日均收益（上红下绿 · 红涨绿跌）</div>
                 </>
               ) : (
                 <p className="text-[13px] text-muted-foreground">该策略在此窗口内无样本</p>

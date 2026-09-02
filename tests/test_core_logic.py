@@ -7223,3 +7223,69 @@ class TestPositionsAggregateFromJournal:
         src = inspect.getsource(positions)
         assert "atomic_write_json" not in src and "open(" not in src.replace("open_positions", ""), \
             "positions 只做聚合，不落盘"
+
+
+class TestChartColorsFollowTheAShareConvention:
+    """图表的**背景色**要和文字色同向：红涨绿跌。
+
+    ⚠️ 条形用绿表示正、而同一行的数字用红表示正 —— 一行里两套配色打架，
+    读的人得停下来想一秒才知道这根条是好是坏。这类不一致跑测试跑不出来、
+    看单页也不觉得奇怪，只有把两者放在一起才刺眼。
+    """
+
+    def _src(self, rel):
+        import pathlib
+
+        return pathlib.Path(rel).read_text(encoding="utf-8")
+
+    def test_colors_module_exposes_bg_constants(self):
+        src = self._src("frontend/src/lib/colors.ts")
+        assert 'UP_BG = "bg-danger"' in src, "涨用红底"
+        assert 'DOWN_BG = "bg-success"' in src, "跌用绿底"
+
+    def test_backtest_bars_use_red_for_positive(self):
+        """回测页的条形：正值红、负值绿，与 pctColor 同向。"""
+        src = self._src("frontend/src/pages/Backtest.tsx")
+        assert '(b.avg ?? 0) > 0 && <div className="h-full rounded-r bg-danger/70"' in src
+        assert '(b.avg ?? 0) < 0 && <div className="h-full rounded-l bg-success/70"' in src
+        assert 'excess > 0 ? "bg-danger/15 text-danger"' in src
+
+    def test_daily_bar_legend_matches_the_colors(self):
+        """图例文案要跟着颜色改 —— 写着「上绿下红」而画的是红涨绿跌，比不写还糟。"""
+        src = self._src("frontend/src/pages/Backtest.tsx")
+        assert "上绿下红" not in src, "配色已改成红涨绿跌，图例文案没跟上"
+        assert "红涨绿跌" in src
+
+
+class TestVersionIsConsistentEverywhere:
+    """版本号在几个地方各写了一份，发版时必须一起改。
+
+    ⚠️ 漏掉界面上那个的话，用户装的是新版、左下角却写着旧版本号 ——
+    发版流程一切正常，只有截图和界面在说谎（v0.2.0 发布时就漏了这一处）。
+    """
+
+    def _read(self, rel):
+        import pathlib
+
+        return pathlib.Path(rel).read_text(encoding="utf-8")
+
+    def test_frontend_version_matches_readme_badge(self):
+        import re
+
+        layout = self._read("frontend/src/components/layout/Layout.tsx")
+        m = re.search(r'APP_VERSION\s*=\s*"v([\d.]+)"', layout)
+        assert m, "Layout.tsx 里找不到 APP_VERSION"
+        ui = m.group(1)
+
+        readme = self._read("README.md")
+        b = re.search(r"badge/version-v([\d.]+)-", readme)
+        assert b, "README 里找不到版本徽章"
+        assert ui == b.group(1), \
+            f"界面显示 v{ui}，README 徽章写 v{b.group(1)} —— 发版时漏改了一处"
+
+    def test_both_readmes_agree_on_version(self):
+        import re
+
+        vs = {f: re.search(r"badge/version-v([\d.]+)-", self._read(f)).group(1)
+              for f in ("README.md", "README_en.md")}
+        assert len(set(vs.values())) == 1, f"中英文 README 版本号不一致：{vs}"
