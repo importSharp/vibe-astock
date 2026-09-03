@@ -400,6 +400,16 @@ set VIBE_LLM_CLI=claude
 ```bash
 .venv/bin/python server.py          # 一个进程一个端口 :8910，十四个入口全在
 ```
+
+**手机同网访问**：默认只监听本机，安全起见不会直接暴露到网络。需要让同一可信 Wi-Fi
+里的手机访问时，启动服务前显式设置以下两个变量（把 IP 换成服务器的局域网 IP 或域名）：
+
+```bash
+VIBE_HOST=0.0.0.0 VIBE_ALLOW_HOSTS=192.168.1.10 .venv/bin/python server.py
+```
+
+然后用手机打开 `http://192.168.1.10:8910`。如果使用域名反向代理，`VIBE_ALLOW_HOSTS`
+填该域名；公网部署还应由反向代理提供 HTTPS 与访问控制。
 ```bash
 .venv/bin/python main.py            # 或者 CLI 直接跑今天的复盘
 ```
@@ -421,6 +431,7 @@ set VIBE_LLM_CLI=claude
 | 变量 | 默认 | 作用 |
 |---|---|---|
 | `VIBE_PORT` | `8910` | 后端端口 |
+| `VIBE_HOST` | `127.0.0.1` | 后端监听地址；同网手机访问时设为 `0.0.0.0` |
 | `VIBE_LLM_CLI` | 未设 | 用本机 CLI 当 LLM（`claude` / `codex` …），设了就不需要 API key |
 | `VIBE_ALLOW_UNSAFE_CLI` | 未设 | 放开 `claude` 以外的 CLI，逗号分隔（见上面那条提醒） |
 | `VIBE_ASTOCK_PROMPTS` | `~/.vibe-astock/prompts_local.py` | 换一套分析口径（见「自定义分析口径」） |

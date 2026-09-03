@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import ipaddress
 import json
 import os
 import re
@@ -46,6 +47,16 @@ os.makedirs(_WK_DIR, exist_ok=True)
 _ALLOWED_HOSTS = {"127.0.0.1", "localhost"} | {
     h.strip() for h in os.environ.get("VIBE_ALLOW_HOSTS", "").split(",") if h.strip()
 }
+
+
+def _listen_host() -> str:
+    """Return an explicit, numeric bind address; stay loopback-only by default."""
+    host = os.environ.get("VIBE_HOST", "127.0.0.1").strip()
+    try:
+        ipaddress.ip_address(host)
+    except ValueError as exc:
+        raise RuntimeError("VIBE_HOST 必须是 IP 地址，例如 127.0.0.1 或 0.0.0.0") from exc
+    return host
 
 app = FastAPI(title="短线每日复盘")
 
@@ -1558,6 +1569,7 @@ if __name__ == "__main__":
 
     # 端口可用 VIBE_PORT 覆盖，默认 8910（被占时不必改代码）
     port = int(os.environ.get("VIBE_PORT", "8910"))
+    host = _listen_host()
     if _DISABLED_CLIS:
         # 有声地说出限制：不说的话，"少了几个可选项"看起来像 bug 而不是有意为之
         print(f"🔒 已禁用自动批准 CLI：{', '.join(_DISABLED_CLIS)}"
@@ -1568,5 +1580,6 @@ if __name__ == "__main__":
         print(f"⚠️  VIBE_ALLOW_UNSAFE_CLI 已放开：{', '.join(sorted(_opted_in_clis()))}"
               f" —— 这些 CLI 会不经询问地读写文件、执行命令，"
               f"而问 AI 时抓来的外部新闻原文会原样进 prompt。确认你信任数据源再用。")
-    print(f"→ 打开 http://127.0.0.1:{port}  （VR 分栏路由 {_VR_ROUTES} 条已并入）")
-    uvicorn.run(app, host="127.0.0.1", port=port)
+    shown_host = "本机局域网 IP" if host in {"0.0.0.0", "::"} else host
+    print(f"→ 监听 {shown_host}:{port}  （VR 分栏路由 {_VR_ROUTES} 条已并入）")
+    uvicorn.run(app, host=host, port=port)

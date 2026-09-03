@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Link, Outlet, useLocation } from "react-router-dom";
 import {
-  Moon, Sun, ChevronsLeft, ChevronsRight, CandlestickChart, Cog, Swords,
+  Moon, Sun, ChevronsLeft, ChevronsRight, CandlestickChart, Cog, Swords, Menu, X,
   Activity, Flame, CalendarRange, Github, Bot, NotebookPen, TrendingDown,
   Microscope, Sunrise, Eye, Briefcase, Star, LineChart, Radio } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
@@ -59,6 +59,7 @@ export function Layout() {
   const { pathname } = useLocation();
   const { dark, toggle } = useDarkMode();
   const [collapsed, setCollapsed] = useState(() => localStorage.getItem("va-sidebar") === "collapsed");
+  const [mobileOpen, setMobileOpen] = useState(false);
 
   useEffect(() => {
     localStorage.setItem("va-sidebar", collapsed ? "collapsed" : "expanded");
@@ -97,11 +98,66 @@ export function Layout() {
       <div className="mb-1 mt-3 px-3 text-[10px] font-bold uppercase tracking-[0.18em] text-muted-foreground/60 first:mt-0">{text}</div>
     );
 
+  const mobileGroup = (label: string, links: Array<{ to: string; icon: LucideIcon; label: string; agent?: boolean }>) => (
+    <section key={label} className="space-y-1">
+      <p className="px-3 pt-3 text-[10px] font-bold uppercase tracking-[0.18em] text-muted-foreground/60">{label}</p>
+      {links.map(({ to, icon: Icon, label: linkLabel, agent }) => {
+        const active = pathname === to;
+        return (
+          <Link key={to} to={to} onClick={() => setMobileOpen(false)}
+            className={cn(
+              "flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm transition-colors",
+              active ? "bg-primary/15 font-medium text-primary shadow-glow" : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
+            )}>
+            <Icon className="h-4 w-4 shrink-0" />
+            <span>{linkLabel}</span>
+            {agent && <Bot className="ml-auto h-3 w-3 text-primary" />}
+          </Link>
+        );
+      })}
+    </section>
+  );
+
   return (
-    <div className="flex h-screen">
+    <div className="min-h-dvh md:flex">
+      <header className="sticky top-0 z-30 flex items-center justify-between border-b border-border/60 bg-background/90 px-4 py-3 backdrop-blur md:hidden">
+        <Link to="/agent/review" className="flex items-center gap-2" aria-label="Vibe-Astock 首页">
+          <CandlestickChart className="h-5 w-5 text-primary text-glow" />
+          <span className="font-extrabold tracking-tight">Vibe-<span className="text-primary">Astock</span></span>
+        </Link>
+        <button type="button" onClick={() => setMobileOpen(true)} className="rounded-lg p-2 text-muted-foreground hover:bg-muted/60 hover:text-foreground" aria-label="打开导航菜单">
+          <Menu className="h-5 w-5" />
+        </button>
+      </header>
+
+      {mobileOpen && (
+        <div className="fixed inset-0 z-50 md:hidden" role="dialog" aria-modal="true" aria-label="导航菜单">
+          <button type="button" className="absolute inset-0 bg-black/60" onClick={() => setMobileOpen(false)} aria-label="关闭导航菜单" />
+          <aside className="relative flex h-full w-[min(19rem,84vw)] flex-col border-r border-border/60 bg-background shadow-2xl">
+            <div className="flex items-center justify-between border-b border-border/60 p-4">
+              <span className="flex items-center gap-2 font-extrabold tracking-tight"><CandlestickChart className="h-5 w-5 text-primary" />Vibe-<span className="text-primary">Astock</span></span>
+              <button type="button" onClick={() => setMobileOpen(false)} className="rounded-lg p-2 text-muted-foreground hover:bg-muted/60 hover:text-foreground" aria-label="关闭导航菜单"><X className="h-5 w-5" /></button>
+            </div>
+            <nav className="flex-1 overflow-y-auto px-3 py-2">
+              {mobileGroup("复盘", REVIEW_NAV)}
+              {mobileGroup("盯盘与自选", WATCH_NAV)}
+              {mobileGroup("按需分析", AGENT_NAV)}
+              {mobileGroup("我的交易", JOURNAL_NAV)}
+              {mobileGroup("设置", SETTINGS_NAV)}
+            </nav>
+            <div className="flex items-center justify-between border-t border-border/60 p-4">
+              <button onClick={toggle} className="flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground">
+                {dark ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}{dark ? "亮色" : "暗色"}
+              </button>
+              <span className="text-[11px] text-muted-foreground/60">{APP_VERSION}</span>
+            </div>
+          </aside>
+        </div>
+      )}
+
       {/* Sidebar */}
       <aside className={cn(
-        "glass z-10 m-2 flex shrink-0 flex-col rounded-2xl transition-all duration-200",
+        "glass z-10 m-2 hidden h-[calc(100dvh-1rem)] shrink-0 flex-col rounded-2xl transition-all duration-200 md:flex",
         collapsed ? "w-14" : "w-60",
       )}>
         {/* Brand */}
@@ -182,8 +238,8 @@ export function Layout() {
       </aside>
 
       {/* Main */}
-      <main className="flex-1 overflow-auto">
-        <div className="mx-auto max-w-6xl px-6 py-6">
+      <main className="min-w-0 flex-1 md:h-screen md:overflow-auto">
+        <div className="mx-auto max-w-6xl px-3 py-4 sm:px-6 sm:py-6">
           <Outlet />
         </div>
       </main>
