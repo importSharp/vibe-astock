@@ -12,6 +12,7 @@ import {
 } from "@/components/MarketFactsPanel";
 import { BreadthPanel } from "@/components/BreadthPanel";
 import { TrendPanel } from "@/components/TrendPanel";
+import { DecisionAssistPanel } from "@/components/DecisionAssistPanel";
 import {
   agentFetch, agentPost, finite, localDate, phaseTone, safeArray,
   type FocusDirection, type ReviewData, type VerificationItem, type JobStatus,
@@ -372,6 +373,9 @@ export function AgentReview() {
         </div>
         <CycleCard cy={em.cy} />
       </section>
+
+      {/* 可选的个人决策辅助与项目原有中立复盘隔离，默认折叠且不发请求。 */}
+      {data && <DecisionAssistPanel date={data.target_date || data.trade_date || ""} />}
 
       {/* AI 研判（放在事实之后）*/}
       {focus && (

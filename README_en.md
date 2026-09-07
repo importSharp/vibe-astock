@@ -26,8 +26,9 @@
 </p>
 
 <p align="center">
-  <b>⚠️ This project only organises, aggregates and comments on public market data at the market and
+  <b>⚠️ The default review only organises, aggregates and comments on public market data at the market and
   sector level. It does not recommend individual stocks, predict prices, or tell you when to buy or sell.<br>
+  The optional personal decision aid provides explainable rule ranking and group history only, not individual forecasts or trade instructions.<br>
   It is not investment advice, and it provides no investment service.</b>
 </p>
 
@@ -61,7 +62,7 @@ pure computation straight from the data source; no AI touches them, and they are
 moment the page loads.** The AI's job is to turn seven or eight data
 sources into one readable story, not to pick stocks.
 
-**What it does not do:** no stock recommendations, no "should you join in", no entry or exit levels.
+**What the default mode does not do:** no stock recommendations, no "should you join in", no entry or exit levels.
 Individual stocks are only ever stated as facts (which theme it belongs to, how many consecutive
 boards, which brokerage desks showed up on the Dragon-Tiger list, where it sits on the chart). Directional and
 sentiment calls stop at the sector level.
@@ -316,6 +317,17 @@ Further down the same page there is a block on **account risk and execution drif
 Scope: it **only aggregates the trades you entered yourself**. No stock picking, no entry/exit
 timing, no suggestion about your next trade — a ledger and a health check, not an advisor. The data
 stays on your machine and ⛔ **never reaches any AI prompt** (enforced by tests).
+
+### Experimental: personal decision aid
+
+The review page contains a **collapsed-by-default, opt-in** decision aid. It does not modify the
+original review or ask an LLM to guess prices. Using facts known after the target session closes, it
+shows a market-environment score, rule-based observation priority, hard risk vetoes, and comparable
+group history. Historical win rates stay hidden until at least 30 samples are available.
+
+The ranking is an observation priority for the next session, not a trade instruction. A group win
+rate is not an individual stock probability, and “no qualifying candidate” is a valid result. The
+endpoint is `GET /api/review/decision-assist?date=YYYY-MM-DD` and is called only after the panel is opened.
 
 ## The core: derived sentiment metrics
 

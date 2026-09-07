@@ -379,6 +379,32 @@ export interface ReviewData {
   analysts?: AnalystReport[];
 }
 
+export interface DecisionCandidate {
+  code: string; name: string; sector: string; boards: number;
+  score: number; status: "重点观察" | "观察" | "低优先级" | "仅跟踪" | "排除";
+  vetoes: string[]; reasons: string[];
+  components: { market: number; theme: number; quality: number; liquidity: number; history: number };
+  history: {
+    strategy: string; sample: number; win_rate: number | null; avg: number | null;
+    median: number | null; limit_up_rate: number | null; enough_samples: boolean;
+    min_samples: number; scope: string;
+  };
+  facts: { first_seal: string | null; last_seal: string | null; broken_times: number; turnover: number | null; amount: number | null };
+}
+
+export interface DecisionAssistData {
+  available: boolean; date?: string; reason?: string; decision_for?: string;
+  environment?: {
+    score: number; level: string; posture: string;
+    signals: { label: string; value: string | number; delta: number; detail: string }[];
+  };
+  candidates?: DecisionCandidate[]; rejected?: DecisionCandidate[];
+  counts?: { source: number; active: number; rejected: number };
+  weights?: Record<string, number>;
+  backtest?: { available: boolean; days_used?: number; date_from?: string; date_to?: string };
+  limitations?: string[];
+}
+
 // ---------- 近5天热度 ----------
 export interface HeatDay {
   date: string;
