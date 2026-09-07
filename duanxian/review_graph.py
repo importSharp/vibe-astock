@@ -12,9 +12,10 @@ from .synthesizer import create_review_judge
 _JUDGE = "复盘裁判"
 
 
-def build_review_graph():
-    quick = make_llm(deep=False)   # 五个分析师
-    deep = make_llm(deep=True)     # 复盘裁判
+def build_review_graph(request_config: dict[str, str] | None = None):
+    kwargs = {"request_config": request_config} if request_config is not None else {}
+    quick = make_llm(deep=False, **kwargs)   # 五个分析师
+    deep = make_llm(deep=True, **kwargs)     # 复盘裁判
 
     g = StateGraph(DuanxianReviewState)
 

@@ -1,4 +1,6 @@
 import { apiUrl } from "@/lib/base";
+import { loadLlm } from "@/lib/llm";
+import { authHeaders } from "@/lib/api";
 import { useEffect, useRef, useState } from "react";
 import { Swords, Loader2, AlertTriangle, Target, CheckSquare } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -200,7 +202,20 @@ export function AgentReview() {
     } catch { /* 拿不到就不显示历史列表，不影响主流程 */ }
   }
 
-  useEffect(() => { loadLatest(); loadDates(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, []);
+  async function loadMarketDate() {
+    try {
+      const r = await agentFetch<{ quotes_of?: string | null }>("/api/market/session");
+      if (alive.current && r.quotes_of) {
+        // 首次打开且尚未载入历史报告时，把今天（周末/盘前）校正到最近行情日。
+        setDate((current) => current === localDate() ? r.quotes_of! : current);
+      }
+    } catch { /* 行情日期取不到时仍允许用户手动选择 */ }
+  }
+
+  useEffect(() => {
+    loadLatest(); loadDates(); loadMarketDate();
+    /* eslint-disable-next-line react-hooks/exhaustive-deps */
+  }, []);
 
   function stopPolling() {
     polling.current = false;
@@ -227,7 +242,15 @@ export function AgentReview() {
     // 这些**需要原样告诉用户**的信息丢掉。
     let resp: Response;
     try {
-      resp = await fetch(apiUrl(`/api/review/run${date ? `?date=${date}` : ""}`), { method: "POST" });
+      const llm = loadLlm();
+      if (llm && !llm.apiKey) {
+        stopPolling(); setErr("复盘暂不支持网页 CLI 配置，请在「接入 AI」选择 API 接入"); return;
+      }
+      resp = await fetch(apiUrl(`/api/review/run${date ? `?date=${date}` : ""}`), {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ llm }),
+      });
     } catch { stopPolling(); if (alive.current) setErr("启动失败"); return; }
     const body = await resp.json().catch(() => null);
     if (!alive.current) return;

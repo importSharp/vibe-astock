@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Mapping
+from urllib.parse import urlparse
 
 from dotenv import dotenv_values
 from langchain_openai import ChatOpenAI
@@ -47,8 +49,39 @@ def _ensure_mimo_loaded() -> None:
     _CREDS = creds
 
 
-def make_llm(deep: bool = False, temperature: float = 0.6):
+def _make_request_llm(config: Mapping[str, str], temperature: float) -> ChatOpenAI:
+    """Build an OpenAI-compatible client from a one-request browser setting.
+
+    The caller must keep this configuration in memory only.  In particular, do
+    not add the API key to an exception, job status, or persisted report.
+    """
+    api_key = str(config.get("apiKey", "")).strip()
+    base_url = str(config.get("baseURL", "")).strip().rstrip("/")
+    model = str(config.get("model", "")).strip()
+    parsed = urlparse(base_url)
+    if not api_key or not model or parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("AI 配置不完整：请在“接入 AI”页填写有效的 Base URL、API Key 和模型名")
+    return ChatOpenAI(
+        model=model,
+        base_url=base_url,
+        api_key=api_key,
+        temperature=temperature,
+        timeout=180,
+        max_retries=2,
+    )
+
+
+def make_llm(
+    deep: bool = False,
+    temperature: float = 0.6,
+    request_config: Mapping[str, str] | None = None,
+):
     """构造复盘用的 LLM"""
+    # An API setting submitted by the local browser takes precedence over the
+    # process-wide MiMo/CLI setting. It is intentionally not cached.
+    if request_config is not None:
+        return _make_request_llm(request_config, temperature)
+
     kind = cli_llm.wanted_kind()
     if kind:
         return cli_llm.make_cli_llm(deep=deep)

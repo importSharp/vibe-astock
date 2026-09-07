@@ -400,19 +400,12 @@ set VIBE_LLM_CLI=claude
 ```bash
 .venv/bin/python server.py          # 一个进程一个端口 :8910，十四个入口全在
 ```
-
-**手机同网访问**：默认只监听本机，安全起见不会直接暴露到网络。需要让同一可信 Wi-Fi
-里的手机访问时，启动服务前显式设置以下两个变量（把 IP 换成服务器的局域网 IP 或域名）：
-
-```bash
-VIBE_HOST=0.0.0.0 VIBE_ALLOW_HOSTS=192.168.1.10 .venv/bin/python server.py
-```
-
-然后用手机打开 `http://192.168.1.10:8910`。如果使用域名反向代理，`VIBE_ALLOW_HOSTS`
-填该域名；公网部署还应由反向代理提供 HTTPS 与访问控制。
 ```bash
 .venv/bin/python main.py            # 或者 CLI 直接跑今天的复盘
 ```
+
+Windows 也可以直接双击仓库根目录的 `start-local.cmd` 后台启动，双击
+`stop-local.cmd` 精确关闭该脚本启动的服务。运行 PID 和日志保存在 `.run/`，该目录不会提交到 Git。
 
 ⚠️ **复盘的对象只能是已经收盘的那一场。** 不带日期时自动取最近已收盘交易日；
 指定一个还没收盘的日子会被拒绝并指回那一场（涨停池 / 龙虎榜盘中都还没定稿，
@@ -431,7 +424,7 @@ VIBE_HOST=0.0.0.0 VIBE_ALLOW_HOSTS=192.168.1.10 .venv/bin/python server.py
 | 变量 | 默认 | 作用 |
 |---|---|---|
 | `VIBE_PORT` | `8910` | 后端端口 |
-| `VIBE_HOST` | `127.0.0.1` | 后端监听地址；同网手机访问时设为 `0.0.0.0` |
+| `VIBE_HOST` | `127.0.0.1` | 监听地址。手机同 Wi-Fi 查看时设为 `0.0.0.0`；不要将端口暴露到公网 |
 | `VIBE_LLM_CLI` | 未设 | 用本机 CLI 当 LLM（`claude` / `codex` …），设了就不需要 API key |
 | `VIBE_ALLOW_UNSAFE_CLI` | 未设 | 放开 `claude` 以外的 CLI，逗号分隔（见上面那条提醒） |
 | `VIBE_ASTOCK_PROMPTS` | `~/.vibe-astock/prompts_local.py` | 换一套分析口径（见「自定义分析口径」） |
@@ -439,6 +432,18 @@ VIBE_HOST=0.0.0.0 VIBE_ALLOW_HOSTS=192.168.1.10 .venv/bin/python server.py
 | `VIBE_MARKET_PROXY` | 未设 | 东财在你这儿**只能经代理**才连得上时设 `1`。等同于 `VR_DATA_PROXY=1`，设哪个都行 |
 | `VIBE_MARKET_DIRECT` | 未设 | 相反方向：代理把东财挂掉、连取涨停池都失败时设 `1` 强行直连。⚠️ 它是**进程级**的，会一并关掉东财请求的代理回退 |
 | `VR_API_KEY` | 未设 | 给盘面数据那几个分栏的接口加一层 key 校验 |
+
+### 手机同 Wi-Fi 查看
+
+电脑和手机连到同一个可信 Wi-Fi 后，在 PowerShell 中用局域网监听模式启动：
+
+```powershell
+$env:VIBE_HOST = "0.0.0.0"
+$env:VIBE_ALLOW_HOSTS = "电脑的局域网IP"
+.venv\Scripts\python server.py
+```
+
+然后在手机浏览器打开 `http://电脑的局域网IP:8910`。Windows 第一次提示防火墙时，只允许**专用网络**；不要允许公用网络。`VIBE_ALLOW_HOSTS` 让手机可以发起写操作（如记录交易）；不设置时仍可浏览数据，但写操作会被拒绝。
 
 ---
 
