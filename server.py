@@ -623,6 +623,32 @@ def api_latest(date: Optional[str] = None):
     return JSONResponse(payload)
 
 
+@app.get("/api/review/decision-assist")
+def api_decision_assist(date: Optional[str] = None):
+    """按需生成个人决策辅助。
+
+    这条接口与中立复盘产物隔离：前端默认不请求，用户主动展开后才计算，
+    也不会把个股评分写回原始复盘 JSON。
+    """
+    if date:
+        try:
+            date = validate_trade_date(date)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+    review = review_store.load(date)
+    if review is None or not review_store.usable(review):
+        return JSONResponse({"available": False, "date": date, "reason": "请先生成该交易日的复盘"})
+    target = str(review.get("target_date") or review.get("trade_date") or date or "")
+    try:
+        from duanxian import decision_assist
+
+        return JSONResponse(decision_assist.build(target, review))
+    except Exception as exc:  # noqa: BLE001  辅助模块失败不能拖垮复盘页
+        print(f"⚠️ 决策辅助生成失败：{type(exc).__name__}: {exc}")
+        return JSONResponse({"available": False, "date": target,
+                             "reason": f"决策辅助生成失败：{type(exc).__name__}"})
+
+
 # ==================== ③ 近 5 天热度 ====================
 _wk_lock = threading.Lock()
 
