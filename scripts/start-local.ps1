@@ -2,6 +2,10 @@
 param()
 
 $ErrorActionPreference = "Stop"
+$utf8Encoding = New-Object System.Text.UTF8Encoding($false)
+[Console]::InputEncoding = $utf8Encoding
+[Console]::OutputEncoding = $utf8Encoding
+$OutputEncoding = $utf8Encoding
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $pythonPath = Join-Path $projectRoot ".venv\Scripts\python.exe"
 $runDirectory = Join-Path $projectRoot ".run"
@@ -63,7 +67,7 @@ for ($attempt = 0; $attempt -lt 40; $attempt++) {
     if ($process.HasExited) {
         Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
         $details = if (Test-Path -LiteralPath $stderrLog) {
-            (Get-Content -LiteralPath $stderrLog -Tail 20) -join "`n"
+            (Get-Content -LiteralPath $stderrLog -Encoding UTF8 -Tail 20) -join "`n"
         } else {
             "No error log was produced."
         }
