@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Send, Loader2, MessageCircle } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { agentPost, type ChatMsg } from "@/lib/agent";
+import { loadLlm } from "@/lib/llm";
 
 interface Props {
   endpoint: string;
@@ -22,7 +23,8 @@ export function AgentChat({ endpoint, placeholder = "就上面的结论追问…
     setInput("");
     setLoading(true);
     try {
-      const r = await agentPost<{ answer?: string; error?: string }>(endpoint, { messages: next });
+      const llm = loadLlm();
+      const r = await agentPost<{ answer?: string; error?: string }>(endpoint, { messages: next, llm });
       setMsgs([...next, { role: "assistant", content: r.answer || `出错：${r.error || "未知"}` }]);
     } catch (e) {
       setMsgs([...next, { role: "assistant", content: `请求失败：${e instanceof Error ? e.message : ""}` }]);

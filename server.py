@@ -766,7 +766,10 @@ def _sanitize_messages(msgs: object) -> tuple[list, Optional[str]]:
     return (out, None) if out else ([], "空消息")
 
 
-def _chat_model():
+def _chat_model(request_llm: dict[str, str] | None = None):
+    # 浏览器按请求提交的 API 配置必须优先于进程级 MiMo/CLI 配置，且不能缓存。
+    if request_llm is not None:
+        return make_llm(deep=False, request_config=request_llm)
     global _chat_llm
     if _chat_llm is None:
         _chat_llm = make_llm(deep=False)
@@ -796,7 +799,12 @@ def _review_context() -> str:
     for a in d.get("analysts", []):
         parts.append(f"【{a.get('title', '')}】\n{_strip_html(a.get('html', ''))}")
     return "\n\n".join(parts)[:8000]
-def _chat(context: str, role_desc: str, messages: list) -> dict:
+def _chat(
+    context: str,
+    role_desc: str,
+    messages: list,
+    request_llm: dict[str, str] | None = None,
+) -> dict:
     system = (
         f"你是{role_desc}。下面是刚才多 agent 产出的结论与数据，用户会就它追问或让你展开。\n"
         f"{PACK.chat_guidance}\n"
@@ -807,10 +815,13 @@ def _chat(context: str, role_desc: str, messages: list) -> dict:
             (_ROLE_MAP.get(m["role"], "human"), m["content"])
             for m in messages[-12:]
         ]
-        ans = _chat_model().invoke(chain).content
+        ans = _chat_model(request_llm).invoke(chain).content
         return {"answer": strip_model_noise(ans)}
     except Exception as exc:  # noqa: BLE001
-        return {"error": f"{type(exc).__name__}: {exc}"}
+        message = f"{type(exc).__name__}: {exc}"
+        if request_llm:
+            message = message.replace(request_llm["apiKey"], "[REDACTED]")
+        return {"error": message}
 
 
 @app.post("/api/review/chat")
@@ -820,7 +831,19 @@ def api_review_chat(request: Request, body: dict = Body(...)):
     msgs, err = _sanitize_messages(body.get("messages"))
     if err:
         return JSONResponse({"error": err}, status_code=400)
-    return _chat(_review_context(), "A 股短线复盘助手", msgs)
+    request_llm = body.get("llm")
+    if request_llm is not None:
+        if not isinstance(request_llm, dict) or any(
+            not isinstance(request_llm.get(k), str) or not request_llm[k].strip()
+            or len(request_llm[k]) > limit
+            for k, limit in (("baseURL", 500), ("apiKey", 500), ("model", 200))
+        ):
+            return JSONResponse({"error": "AI 配置不完整，请在「接入 AI」填写 API 地址、密钥和模型"}, status_code=400)
+        request_llm = {k: request_llm[k].strip() for k in ("baseURL", "apiKey", "model")}
+        parsed = urlparse(request_llm["baseURL"])
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+            return JSONResponse({"error": "AI API 地址无效"}, status_code=400)
+    return _chat(_review_context(), "A 股短线复盘助手", msgs, request_llm)
 
 
 def index():
