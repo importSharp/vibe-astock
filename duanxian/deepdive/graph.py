@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from typing import Mapping
 
 from langgraph.graph import END, START, StateGraph
 
@@ -23,10 +24,13 @@ _JUDGE = "裁判"
 _ROUTES = {JOIN: JOIN, AVOID: AVOID, _JUDGE: _JUDGE}
 
 
-def build_deepdive_graph(max_rounds: int = 1):
+def build_deepdive_graph(
+    max_rounds: int = 1,
+    request_llm: Mapping[str, str] | None = None,
+):
     router = make_debate_router(JOIN, AVOID, _JUDGE, max_rounds)  # 共享路由，含轮数校验
-    quick = make_llm(deep=False)
-    deep = make_llm(deep=True)
+    quick = make_llm(deep=False, request_config=request_llm)
+    deep = make_llm(deep=True, request_config=request_llm)
     g = StateGraph(StockDeepDiveState)
     g.add_node("题材归属", create_theme_analyst(quick))
     g.add_node("资金流向", create_capital_analyst(quick))
@@ -47,7 +51,11 @@ def build_deepdive_graph(max_rounds: int = 1):
     return g.compile()
 
 
-def run(code_or_name: str, trade_date: str | None = None) -> dict:
+def run(
+    code_or_name: str,
+    trade_date: str | None = None,
+    request_llm: Mapping[str, str] | None = None,
+) -> dict:
     """深挖一只票。返回 final state，含 verdict / verdict_struct / 四报告 / 辩论。"""
     code, name = data.resolve(code_or_name)
     if not code:
@@ -62,5 +70,5 @@ def run(code_or_name: str, trade_date: str | None = None) -> dict:
         "debate_state": new_stock_debate_state(),
         "verdict": "", "verdict_struct": None,
     }
-    graph = build_deepdive_graph()
+    graph = build_deepdive_graph(request_llm=request_llm)
     return graph.invoke(init, {"recursion_limit": 50})

@@ -2,7 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import { Microscope, Loader2, Target } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { AgentChat } from "@/components/AgentChat";
-import { agentFetch, safeArray, type DeepDiveData, type JobStatus } from "@/lib/agent";
+import { agentFetch, agentPost, safeArray, type DeepDiveData, type JobStatus } from "@/lib/agent";
+import { loadLlm } from "@/lib/llm";
 
 const DISCLAIMER =
   "本页由多 agent AI 基于公开数据现场生成，结论为 AI 判断，仅供参考，不构成投资建议；市场有风险，决策与盈亏自负。";
@@ -69,11 +70,16 @@ export function DeepDive() {
   async function deepdive() {
     const s = stock.trim();
     if (!s) { setMsg("请输入代码或简称"); return; }
+    const llm = loadLlm();
+    if (!llm || llm.provider.startsWith("cli-")) {
+      setMsg("请先在“接入 AI”页配置 API Key；个股深挖暂不支持 CLI 订阅通道");
+      return;
+    }
     if (running || polling.current) return;   // ⚠️ 光看 state 挡不住极快双击
     polling.current = true;
     setRunning(true); setMsg(""); setElapsed(0);
     try {
-      const resp = await agentFetch<JobStatus>(`/api/deepdive/run?stock=${encodeURIComponent(s)}`, "POST");
+      const resp = await agentPost<JobStatus>("/api/deepdive/run", { stock: s, llm });
       if (resp.busy) { stopPolling(); if (alive.current) setMsg(`正在深挖 ${resp.stock}，请稍后再试`); return; }
     } catch { stopPolling(); if (alive.current) setMsg("启动失败"); return; }
     pollOnce();

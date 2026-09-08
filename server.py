@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import ipaddress
 import json
 import os
 import re
@@ -11,10 +12,11 @@ import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Annotated, Optional
 from urllib.parse import urlparse
 
 from fastapi import Body, FastAPI, Request
+from pydantic import BaseModel, Field
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -46,6 +48,16 @@ os.makedirs(_WK_DIR, exist_ok=True)
 _ALLOWED_HOSTS = {"127.0.0.1", "localhost"} | {
     h.strip() for h in os.environ.get("VIBE_ALLOW_HOSTS", "").split(",") if h.strip()
 }
+
+
+def _listen_host() -> str:
+    """Return an explicit, numeric bind address; stay loopback-only by default."""
+    host = os.environ.get("VIBE_HOST", "127.0.0.1").strip()
+    try:
+        ipaddress.ip_address(host)
+    except ValueError as exc:
+        raise RuntimeError("VIBE_HOST 必须是 IP 地址，例如 127.0.0.1 或 0.0.0.0") from exc
+    return host
 
 app = FastAPI(title="短线每日复盘")
 
@@ -366,7 +378,7 @@ def _capture_backtest_corpus(date: str) -> None:
         print(f"⚠️ 回测语料捕获异常：{type(exc).__name__}: {exc}")
 
 
-def _run_review(date: str, job_id: str) -> None:
+def _run_review(date: str, job_id: str, request_llm: dict[str, str] | None = None) -> None:
     try:
         # 先体检输入 —— 核心数据取不到就别跑。喂空数据进去，模型会硬凑出
         # 看着可信的结论（实测点到一只当天 -6.81% 的票当"主线代表"）。
@@ -374,7 +386,7 @@ def _run_review(date: str, job_id: str) -> None:
         if not pre["ok"]:
             raise RuntimeError(preflight.refuse_reason(pre, date))
 
-        graph = build_review_graph()
+        graph = build_review_graph(request_config=request_llm) if request_llm is not None else build_review_graph()
         final = graph.invoke(initial_state(date), {"recursion_limit": 50})
         reflection.auto_evaluate_prior(date)  # 先回评上期预测（其次日=今天，数据已出）
         # 体检发现的非核心缺失要如实落进 warnings，界面才会显示「⚠ 部分数据降级」
@@ -389,7 +401,10 @@ def _run_review(date: str, job_id: str) -> None:
     except Exception as exc:  # noqa: BLE001
         with _lock:
             if _job["job_id"] == job_id:
-                _job["error"] = f"{type(exc).__name__}: {exc}"
+                message = f"{type(exc).__name__}: {exc}"
+                if request_llm:
+                    message = message.replace(request_llm["apiKey"], "[REDACTED]")
+                _job["error"] = message
     finally:
         with _lock:
             if _job["job_id"] == job_id:  # 只结束属于自己的任务（#5）
@@ -413,9 +428,22 @@ def _force_flag(request: Request) -> bool:
 
 
 @app.post("/api/review/run")
-def api_run(request: Request, date: str | None = None):
+def api_run(request: Request, date: str | None = None, body: Annotated[dict | None, Body()] = None):
     if not _origin_ok(request):
         return JSONResponse({"error": "非法来源"}, status_code=403)
+    request_llm = (body or {}).get("llm")
+    if request_llm is not None:
+        # Validate without echoing the submitted credential in an error response.
+        if not isinstance(request_llm, dict) or any(
+            not isinstance(request_llm.get(k), str) or not request_llm[k].strip()
+            or len(request_llm[k]) > limit
+            for k, limit in (("baseURL", 500), ("apiKey", 500), ("model", 200))
+        ):
+            return JSONResponse({"error": "AI 配置不完整，请在「接入 AI」填写 API 地址、密钥和模型"}, status_code=400)
+        request_llm = {k: request_llm[k].strip() for k in ("baseURL", "apiKey", "model")}
+        parsed = urlparse(request_llm["baseURL"])
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+            return JSONResponse({"error": "AI API 地址无效"}, status_code=400)
     try:
         explicit = bool(date)
         if not explicit:
@@ -452,7 +480,7 @@ def api_run(request: Request, date: str | None = None):
         job_id = uuid.uuid4().hex
         _job.update(running=True, job_id=job_id, date=date, error=None,
                     started=time.time(), elapsed=0, finished_at=None)
-    threading.Thread(target=_run_review, args=(date, job_id), daemon=True).start()
+    threading.Thread(target=_run_review, args=(date, job_id, request_llm), daemon=True).start()
     return {"running": True, "date": date, "job_id": job_id}
 
 
@@ -1314,10 +1342,24 @@ def _serialize_dd(final: dict) -> dict:
     }
 
 
-def _run_dd(stock: str, job_id: str) -> None:
+class _DeepDiveLlm(BaseModel):
+    """Transient browser-held API configuration for a deep-dive job."""
+
+    provider: str = Field(max_length=40)
+    baseURL: str = Field(min_length=1, max_length=500)
+    apiKey: str = Field(min_length=1, max_length=500)
+    model: str = Field(min_length=1, max_length=200)
+
+
+class _DeepDiveRunRequest(BaseModel):
+    stock: str = Field(min_length=1, max_length=80)
+    llm: _DeepDiveLlm
+
+
+def _run_dd(stock: str, job_id: str, request_llm: dict[str, str]) -> None:
     error = None
     try:
-        final = deepdive_run(stock)
+        final = deepdive_run(stock, request_llm=request_llm)
         if final.get("error"):
             error = final["error"]
         else:
@@ -1338,10 +1380,10 @@ def _run_dd(stock: str, job_id: str) -> None:
 
 
 @app.post("/api/deepdive/run")
-def api_dd_run(request: Request, stock: str):
+def api_dd_run(request: Request, payload: _DeepDiveRunRequest):
     if not _origin_ok(request):
         return JSONResponse({"error": "非法来源"}, status_code=403)
-    stock = (stock or "").strip()
+    stock = payload.stock.strip()
     if not stock:
         return JSONResponse({"error": "缺 stock 参数（6 位代码或简称）"}, status_code=400)
     with _lock:
@@ -1354,7 +1396,9 @@ def api_dd_run(request: Request, stock: str):
         job_id = uuid.uuid4().hex
         _dd_job.update(running=True, job_id=job_id, stock=stock, error=None,
                        started=time.time(), elapsed=0, finished_at=None)
-    threading.Thread(target=_run_dd, args=(stock, job_id), daemon=True).start()
+    # Keep the key out of _dd_job and disk; the worker owns this in-memory copy.
+    request_llm = payload.llm.model_dump()
+    threading.Thread(target=_run_dd, args=(stock, job_id, request_llm), daemon=True).start()
     return {"running": True, "busy": False, "stock": stock, "job_id": job_id}
 
 
@@ -1559,6 +1603,7 @@ if __name__ == "__main__":
 
     # 端口可用 VIBE_PORT 覆盖，默认 8910（被占时不必改代码）
     port = int(os.environ.get("VIBE_PORT", "8910"))
+    host = _listen_host()
     if _DISABLED_CLIS:
         # 有声地说出限制：不说的话，"少了几个可选项"看起来像 bug 而不是有意为之
         print(f"🔒 已禁用自动批准 CLI：{', '.join(_DISABLED_CLIS)}"
@@ -1569,5 +1614,6 @@ if __name__ == "__main__":
         print(f"⚠️  VIBE_ALLOW_UNSAFE_CLI 已放开：{', '.join(sorted(_opted_in_clis()))}"
               f" —— 这些 CLI 会不经询问地读写文件、执行命令，"
               f"而问 AI 时抓来的外部新闻原文会原样进 prompt。确认你信任数据源再用。")
-    print(f"→ 打开 http://127.0.0.1:{port}  （VR 分栏路由 {_VR_ROUTES} 条已并入）")
-    uvicorn.run(app, host="127.0.0.1", port=port)
+    shown_host = "本机局域网 IP" if host in {"0.0.0.0", "::"} else host
+    print(f"→ 监听 {shown_host}:{port}  （VR 分栏路由 {_VR_ROUTES} 条已并入）")
+    uvicorn.run(app, host=host, port=port)
