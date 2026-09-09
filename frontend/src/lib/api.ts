@@ -158,7 +158,7 @@ export interface ShortTermEmotion {
   yzt_count: number;
 }
 
-// 每日盯盘：3 秒实时快照（持仓/自选/500亿大票/三板+/昨日成交前十 + 异动流）
+// 每日盯盘：3 秒实时快照（持仓/自选/大票/首板/二板/三板+/昨十 + 异动流）
 export interface WatchRow {
   code: string; name: string;
   price: number | null; pct: number | null; amount: number | null;
@@ -172,6 +172,8 @@ export interface MonitorSnapshot {
   ts: string; phase: "open" | "break" | "closed"; poll_seconds: number;
   holdings: WatchRow[]; watchlist: WatchRow[];
   bigcap: { total: number; top: WatchRow[] };
+  first_board: { total: number; sealed: number; broken: number; stocks: WatchRow[] };
+  second_board: { total: number; sealed: number; broken: number; stocks: WatchRow[] };
   lianban3: WatchRow[];
   turnover: { label: string; stocks: WatchRow[] };
   alerts: MonitorAlert[];

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { pctColor } from "@/lib/colors";
-import { Wallet, Star, Building2, Flame, BarChart3, BellRing, Loader2, Plus, X } from "lucide-react";
+import { Wallet, Star, Building2, Flame, BarChart3, BellRing, Loader2, Plus, X, Circle, Layers } from "lucide-react";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { GlassCard } from "@/components/ui/GlassCard";
 import { Disclaimer } from "@/components/ui/Disclaimer";
@@ -162,7 +162,7 @@ export function DailyWatch() {
     <div>
       <PageHeader
         title="每日盯盘"
-        subtitle="持仓 · 自选 · 500亿大票异动 · 三板+ · 昨日成交前十 —— 交易时段每 3 秒实时刷新（L1 快照极限频率）"
+        subtitle="持仓 · 自选 · 500亿大票异动 · 首板 · 二板 · 三板+ · 昨日成交前十 —— 交易时段每 3 秒实时刷新"
       />
 
       {/* 状态条 */}
@@ -172,7 +172,7 @@ export function DailyWatch() {
           {PHASE_LABEL[phase]}
         </span>
         {snap?.ts && <span>快照 {snap.ts}</span>}
-        <span>监控池：500亿大票 {snap?.bigcap.total ?? 0} 只 + 持仓/自选/连板/昨十</span>
+        <span>监控池：500亿大票 {snap?.bigcap.total ?? 0} 只 + 首板/二板/三板+/持仓/自选/昨十</span>
         <span className="inline-flex items-center gap-1"><BellRing className="h-3.5 w-3.5" /> 今日异动 {snap?.alerts.length ?? 0} 条</span>
         {err && <span className="text-danger">{err}</span>}
       </div>
@@ -270,6 +270,32 @@ export function DailyWatch() {
             <BarChart3 className="h-4 w-4 text-primary" /> {snap?.turnover.label || "昨日成交前十"}
           </div>
           <QuoteTable rows={snap?.turnover.stocks ?? []} cols={["amount"]} watch={watch} onToggleWatch={toggleWatch} />
+        </GlassCard>
+      </div>
+
+      {/* 首板 / 二板：仿三板以上，名单每分钟同步，行情与封开状态每 3 秒刷新 */}
+      <div className="mt-4 grid items-start gap-4 lg:grid-cols-2">
+        <GlassCard>
+          <div className="mb-2 flex flex-wrap items-center gap-2 text-sm font-semibold">
+            <Circle className="h-4 w-4 text-primary" /> 今日首板
+            <span className="text-xs font-normal text-muted-foreground">
+              触板 {snap?.first_board?.total ?? 0} · 封板 {snap?.first_board?.sealed ?? 0} · 炸板 {snap?.first_board?.broken ?? 0}
+            </span>
+          </div>
+          <div className="max-h-[34rem] overflow-y-auto">
+            <QuoteTable rows={snap?.first_board?.stocks ?? []} cols={["boards", "amount"]} watch={watch} onToggleWatch={toggleWatch} />
+          </div>
+        </GlassCard>
+        <GlassCard>
+          <div className="mb-2 flex flex-wrap items-center gap-2 text-sm font-semibold">
+            <Layers className="h-4 w-4 text-primary" /> 今日二板
+            <span className="text-xs font-normal text-muted-foreground">
+              触板 {snap?.second_board?.total ?? 0} · 封板 {snap?.second_board?.sealed ?? 0} · 炸板 {snap?.second_board?.broken ?? 0}
+            </span>
+          </div>
+          <div className="max-h-[34rem] overflow-y-auto">
+            <QuoteTable rows={snap?.second_board?.stocks ?? []} cols={["boards", "amount"]} watch={watch} onToggleWatch={toggleWatch} />
+          </div>
         </GlassCard>
       </div>
 

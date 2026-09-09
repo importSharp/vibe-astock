@@ -1,7 +1,8 @@
 """每日盯盘数据层 —— 盘中 3 秒轮询的实时监控（短线投资实例专属，不回推开源仓库）。
 
-五个模块的标的池：持仓股（后端可读）/ 自选股（前端传入）/ 总市值≥500亿大票（东财市值榜，
-每日一次）/ 三连板以上（东财涨停池，60 秒刷新）/ 昨日成交额前十（收盘快照，次日复用）。
+七个模块的标的池：持仓股（后端可读）/ 自选股（前端传入）/ 总市值≥500亿大票（东财市值榜，
+每日一次）/ 今日首板、二板、三连板以上（东财涨停池 + 炸板池，60 秒刷新）/
+昨日成交额前十（收盘快照，次日复用）。
 
 架构：常驻轮询线程只在交易时段活跃 —— 每 3 秒用腾讯批量行情（qt.gtimg.cn，L1 快照 3 秒
 一帧、不封 IP、60 只/请求）拉全池，内存帧差分做异动检测（急拉急跌/触板开板，冷却去重），
@@ -45,7 +46,9 @@ _alerts: list[dict] = []          # 当日异动事件（新的在前）
 _alert_last: dict[tuple, float] = {}
 _snapshot: dict = {}              # 前端直接读的最新快照
 _bigcaps_cache: tuple[str, list] | None = None   # (date, [{code,name}])
+_board_pools_cache: tuple[float, str, list] = (0.0, "", [])
 _lianban_cache: tuple[float, list] = (0.0, [])
+_prev_boards_cache: tuple[str, dict[str, int]] = ("", {})
 _turnover_saved_date = ""
 
 
@@ -148,8 +151,142 @@ def _bigcaps() -> list[dict]:
         return []
 
 
+def _ths_boards(item: dict) -> int:
+    """同花顺 high_days 转连续板数；N天M板且 N!=M 属于断板反包，不算连板。"""
+    label = str(item.get("high_days") or "").strip()
+    if label == "首板":
+        return 1
+    day_board = re.search(r"(\d+)天(\d+)板", label)
+    if day_board:
+        days, boards = map(int, day_board.groups())
+        return boards if days == boards else 0
+    consecutive = re.search(r"(\d+)连板", label)
+    if consecutive:
+        return int(consecutive.group(1))
+    plain = re.fullmatch(r"(\d+)板", label)
+    if plain:
+        return int(plain.group(1))
+
+    # 极少数响应不带 high_days，只能从编码高 16 位兜底读取板数。
+    try:
+        encoded = int(item.get("high_days_value") or 0)
+        if encoded >> 16:
+            return encoded >> 16
+    except (TypeError, ValueError):
+        pass
+    return 0
+
+
+def _ths_board_pool(endpoint: str, date: str) -> list[dict]:
+    """同花顺涨停/炸板池，作为东财 push2ex 不可用时的备用源。"""
+    params = urllib.parse.urlencode({
+        "page": 1,
+        "limit": 200,
+        "field": "199112,10,9001,330323,330324,330325,9002,330329,133971,133970,1968584,3475914,9003,9004",
+        "filter": "HS,GEM2STAR",
+        "order_field": "330324",
+        "order_type": "0",
+        "date": date,
+    })
+    url = f"https://data.10jqka.com.cn/dataapi/limit_up/{endpoint}?{params}"
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": UA,
+            "Referer": "https://data.10jqka.com.cn/limit_up/",
+        })
+        payload = json.loads(urllib.request.urlopen(req, timeout=10).read().decode("utf-8"))
+        info = (payload.get("data") or {}).get("info") or []
+        return [{
+            "c": str(p.get("code", "")),
+            "n": p.get("name", ""),
+            "lbc": _ths_boards(p),
+        } for p in info]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _previous_limit_boards(today: str) -> dict[str, int]:
+    """上一交易日涨停股及其连续板数；用于识别今日炸板属于首板还是二板。"""
+    global _prev_boards_cache
+    if _prev_boards_cache[0] == today:
+        return _prev_boards_cache[1]
+    base = datetime.strptime(today, "%Y%m%d").date()
+    result: dict[str, int] = {}
+    for back in range(1, 9):
+        day = base - timedelta(days=back)
+        if day.weekday() >= 5:
+            continue
+        d = day.strftime("%Y%m%d")
+        pool = astock.em_zt_topic_pool("getTopicZTPool", d, "fbt:asc")
+        if not pool:
+            pool = _ths_board_pool("limit_up_pool", d)
+        if pool:
+            result = {
+                str(p.get("c", "")): int(p.get("lbc") or 1)
+                for p in pool if re.match(r"^\d{6}$", str(p.get("c", "")))
+            }
+            break
+    _prev_boards_cache = (today, result)
+    return result
+
+
+def _classify_broken_boards(broken: list[dict], previous: dict[str, int]) -> list[dict]:
+    """炸板池缺板数时，按昨日是否连续涨停推导今天尝试的板位。"""
+    out = []
+    for item in broken:
+        normalized = dict(item)
+        if int(normalized.get("lbc") or 0) < 1:
+            code = str(normalized.get("c", ""))
+            normalized["lbc"] = previous.get(code, 0) + 1
+        out.append(normalized)
+    return out
+
+
+def _board_pools() -> list[dict]:
+    """今日所有触板股（封板 + 炸板），盘中每 60 秒同步一次。
+
+    股票池只认今天，不向前回溯，避免盘前或休市日把上一交易日误标成“今日”。
+    行情线程仍每 3 秒检查实时价格，所以池同步间隔内发生的开板也能立即反映。
+    """
+    global _board_pools_cache
+    now = time.time()
+    today = datetime.now(BEIJING).strftime("%Y%m%d")
+    cached_at, cached_date, cached = _board_pools_cache
+    if cached_date == today and now - cached_at < 60:
+        return cached
+
+    sealed = astock.em_zt_topic_pool("getTopicZTPool", today, "fbt:asc")
+    broken = astock.em_zt_topic_pool("getTopicZBPool", today, "fbt:asc")
+    if not sealed:
+        sealed = _ths_board_pool("limit_up_pool", today)
+    if not broken:
+        broken = _ths_board_pool("open_limit_pool", today)
+    if any(int(p.get("lbc") or 0) < 1 for p in broken):
+        broken = _classify_broken_boards(broken, _previous_limit_boards(today))
+    merged: dict[str, dict] = {}
+    for is_limit, pool in ((False, broken), (True, sealed)):
+        for p in pool:
+            code = str(p.get("c", ""))
+            boards = int(p.get("lbc") or 0)
+            if not re.match(r"^\d{6}$", code) or boards < 1:
+                continue
+            merged[code] = {
+                "code": code,
+                "name": p.get("n", ""),
+                "boards": boards,
+                "is_limit": is_limit,
+            }
+
+    stocks = sorted(merged.values(), key=lambda x: (-x["boards"], x["code"]))
+    # 数据源偶发返回空列表时保留同日已有池，避免整块 UI 瞬间清空。
+    if not stocks and cached_date == today and cached:
+        stocks = cached
+    _board_pools_cache = (now, today, stocks)
+    return stocks
+
+
 def _lianban3() -> list[dict]:
-    """三连板以上名单（东财涨停池，盘中 60 秒刷新一次，附连板数）。"""
+    """三连板以上名单：保持原口径，只取涨停池，不并入炸板池。"""
     global _lianban_cache
     if time.time() - _lianban_cache[0] < 60:
         return _lianban_cache[1]
@@ -284,7 +421,7 @@ def _detect(code: str, q: dict, sources: list[str]) -> None:
 
 # ---------------------------------------------------------------- 主循环
 def _build_snapshot(quotes: dict, holdings: list[dict], watch: list[str],
-                    bigcaps: list[dict], lianban: list[dict],
+                    bigcaps: list[dict], board_pools: list[dict], lianban: list[dict],
                     turnover_label: str, turnover: list[dict], phase: str) -> dict:
     def row(code: str) -> dict:
         q = quotes.get(code) or {}
@@ -305,9 +442,35 @@ def _build_snapshot(quotes: dict, holdings: list[dict], watch: list[str],
             r["pnl_pct"] = round((r["price"] / h["cost"] - 1) * 100, 2)
         hold_rows.append(r)
 
+    board_rows = []
+    for s in board_pools:
+        r = row(s["code"])
+        if not r["name"]:
+            r["name"] = s.get("name", "")
+        r["boards"] = s["boards"]
+        q = quotes.get(s["code"]) or {}
+        if q.get("zt_price") and q.get("price") is not None:
+            r["is_limit"] = q["price"] >= q["zt_price"] - 1e-6
+        else:
+            r["is_limit"] = s.get("is_limit", False)
+        board_rows.append(r)
+
+    def board_group(boards: int | None = None, minimum: int | None = None) -> dict:
+        rows = [r for r in board_rows
+                if (r["boards"] == boards if boards is not None else r["boards"] >= (minimum or 1))]
+        rows.sort(key=lambda r: (
+            r.get("is_limit") is not True,
+            -(r["pct"] if isinstance(r.get("pct"), (int, float)) else -999),
+            r["code"],
+        ))
+        sealed = sum(1 for r in rows if r.get("is_limit") is True)
+        return {"total": len(rows), "sealed": sealed, "broken": len(rows) - sealed, "stocks": rows}
+
     lianban_rows = []
     for s in lianban:
         r = row(s["code"])
+        if not r["name"]:
+            r["name"] = s.get("name", "")
         r["boards"] = s["boards"]
         q = quotes.get(s["code"]) or {}
         if q.get("zt_price") and q.get("price") is not None:
@@ -326,6 +489,8 @@ def _build_snapshot(quotes: dict, holdings: list[dict], watch: list[str],
         "holdings": hold_rows,
         "watchlist": [row(c) for c in watch],
         "bigcap": {"total": len(bigcaps), "top": bigcap_rows},
+        "first_board": board_group(boards=1),
+        "second_board": board_group(boards=2),
         "lianban3": lianban_rows,
         "turnover": {"label": turnover_label, "stocks": [row(t["code"]) for t in turnover]},
         "alerts": _alerts[:120],
@@ -345,6 +510,7 @@ def _loop() -> None:
             with _lock:
                 watch = list(_extra_watch)
             bigcaps = _bigcaps()
+            board_pools = _board_pools()
             lianban = _lianban3()
             turnover_label, turnover = _turnover_yesterday()
 
@@ -355,6 +521,8 @@ def _loop() -> None:
                 pool.setdefault(c, []).append("自选")
             for b in bigcaps:
                 pool.setdefault(b["code"], []).append("大票")
+            for s in board_pools:
+                pool.setdefault(s["code"], []).append("首板/二板")
             for s in lianban:
                 pool.setdefault(s["code"], []).append("连板")
             for t in turnover:
@@ -364,7 +532,7 @@ def _loop() -> None:
             if phase == "open":
                 for code, q in quotes.items():
                     _detect(code, q, pool[code])
-            _snapshot = _build_snapshot(quotes, holdings, watch, bigcaps, lianban,
+            _snapshot = _build_snapshot(quotes, holdings, watch, bigcaps, board_pools, lianban,
                                         turnover_label, turnover, phase)
         except Exception:  # noqa: BLE001  数据源抖动不杀线程，下一轮重试
             pass
@@ -397,4 +565,6 @@ def set_watch(codes: list[str]) -> None:
 def get_snapshot() -> dict:
     return _snapshot or {"ts": "", "phase": _market_phase(), "poll_seconds": POLL_SECONDS,
                          "holdings": [], "watchlist": [], "bigcap": {"total": 0, "top": []},
+                         "first_board": {"total": 0, "sealed": 0, "broken": 0, "stocks": []},
+                         "second_board": {"total": 0, "sealed": 0, "broken": 0, "stocks": []},
                          "lianban3": [], "turnover": {"label": "", "stocks": []}, "alerts": []}
