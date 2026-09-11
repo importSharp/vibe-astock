@@ -47,7 +47,6 @@ _alert_last: dict[tuple, float] = {}
 _snapshot: dict = {}              # 前端直接读的最新快照
 _bigcaps_cache: tuple[str, list] | None = None   # (date, [{code,name}])
 _board_pools_cache: tuple[float, str, list] = (0.0, "", [])
-_lianban_cache: tuple[float, list] = (0.0, [])
 _prev_boards_cache: tuple[str, dict[str, int]] = ("", {})
 _turnover_saved_date = ""
 
@@ -285,25 +284,16 @@ def _board_pools() -> list[dict]:
     return stocks
 
 
-def _lianban3() -> list[dict]:
-    """三连板以上名单：保持原口径，只取涨停池，不并入炸板池。"""
-    global _lianban_cache
-    if time.time() - _lianban_cache[0] < 60:
-        return _lianban_cache[1]
-    today = datetime.now(BEIJING).date()
-    stocks: list[dict] = []
-    for back in range(8):
-        d = (today - timedelta(days=back)).strftime("%Y%m%d")
-        pool = astock.em_zt_topic_pool("getTopicZTPool", d, "fbt:asc")
-        if pool:
-            stocks = [
-                {"code": str(p.get("c", "")), "name": p.get("n", ""), "boards": int(p.get("lbc") or 1)}
-                for p in pool
-                if int(p.get("lbc") or 1) >= 3
-            ]
-            break
-    _lianban_cache = (time.time(), sorted(stocks, key=lambda x: -x["boards"]))
-    return _lianban_cache[1]
+def _lianban3(board_pools: list[dict] | None = None) -> list[dict]:
+    """今日三板以上触板股，与首板/二板共用同一份今日股票池。
+
+    旧实现会在今日池取不到时向前回溯，于是盘中首板/二板显示今天，三板以上却
+    显示昨天。主服务还会把复盘口径的东财接口锁到已收盘交易日，这个错位因此
+    稳定复现。今日池本身已经有东财失败时的同花顺降级，直接从它筛选即可；
+    同时保留炸板股，交给实时行情标出“封/开”。
+    """
+    pool = board_pools if board_pools is not None else _board_pools()
+    return [dict(s) for s in pool if int(s.get("boards") or 0) >= 3]
 
 
 def _turnover_file() -> Path:
@@ -483,6 +473,7 @@ def _build_snapshot(quotes: dict, holdings: list[dict], watch: list[str],
     )[:10]
 
     return {
+        "date": datetime.now(BEIJING).strftime("%Y-%m-%d"),
         "ts": datetime.now(BEIJING).strftime("%H:%M:%S"),
         "phase": phase,
         "poll_seconds": POLL_SECONDS,
@@ -511,7 +502,7 @@ def _loop() -> None:
                 watch = list(_extra_watch)
             bigcaps = _bigcaps()
             board_pools = _board_pools()
-            lianban = _lianban3()
+            lianban = _lianban3(board_pools)
             turnover_label, turnover = _turnover_yesterday()
 
             pool: dict[str, list[str]] = {}
@@ -563,7 +554,8 @@ def set_watch(codes: list[str]) -> None:
 
 
 def get_snapshot() -> dict:
-    return _snapshot or {"ts": "", "phase": _market_phase(), "poll_seconds": POLL_SECONDS,
+    return _snapshot or {"date": datetime.now(BEIJING).strftime("%Y-%m-%d"),
+                         "ts": "", "phase": _market_phase(), "poll_seconds": POLL_SECONDS,
                          "holdings": [], "watchlist": [], "bigcap": {"total": 0, "top": []},
                          "first_board": {"total": 0, "sealed": 0, "broken": 0, "stocks": []},
                          "second_board": {"total": 0, "sealed": 0, "broken": 0, "stocks": []},

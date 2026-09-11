@@ -2,6 +2,7 @@ import { apiUrl } from "@/lib/base";
 import { loadLlm } from "@/lib/llm";
 import { authHeaders } from "@/lib/api";
 import { useEffect, useRef, useState } from "react";
+import { Link } from "react-router-dom";
 import { Swords, Loader2, AlertTriangle, Target, CheckSquare } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { AgentChat } from "@/components/AgentChat";
@@ -161,6 +162,9 @@ export function AgentReview() {
   const [err, setErr] = useState("");
   // 「已复盘/还没收盘」这类不是错误、是正常告知，跟 err 分开显示
   const [notice, setNotice] = useState("");
+  const [marketSession, setMarketSession] = useState<{
+    quotes_of?: string | null; phase?: string; label?: string;
+  } | null>(null);
   // polling: 防重入（React state 在同一轮渲染里读到的是旧值，双击能穿过去）
   // timer / alive: 卸载后停掉轮询，别再 setState
   // reqId: 只接受最后一次请求的响应，防止慢的旧响应覆盖新结果
@@ -205,8 +209,9 @@ export function AgentReview() {
 
   async function loadMarketDate() {
     try {
-      const r = await agentFetch<{ quotes_of?: string | null }>("/api/market/session");
+      const r = await agentFetch<{ quotes_of?: string | null; phase?: string; label?: string }>("/api/market/session");
       if (alive.current && r.quotes_of) {
+        setMarketSession(r);
         // 首次打开且尚未载入历史报告时，把今天（周末/盘前）校正到最近行情日。
         setDate((current) => current === localDate() ? r.quotes_of! : current);
       }
@@ -274,6 +279,8 @@ export function AgentReview() {
   }
 
   const focus = data?.focus;
+  const reportDate = data?.target_date || data?.trade_date || "";
+  const reviewIsStale = Boolean(reportDate && marketSession?.quotes_of && reportDate < marketSession.quotes_of);
   // 页面按"用户复盘的顺序"重排后，各卡片散在不同区块里，这里统一取一次
   const facts = data?.market_facts;
   const em = splitMetrics(data?.emotion_metrics);
@@ -318,6 +325,20 @@ export function AgentReview() {
           </button>
         </div>
       </div>
+
+      {reviewIsStale && (
+        <div className="flex flex-wrap items-center gap-2 rounded-xl border border-warning/40 bg-warning/10 px-4 py-3 text-sm text-warning">
+          <AlertTriangle className="h-4 w-4 shrink-0" />
+          <span>
+            当前展示的是 {reportDate} 收盘复盘，行情已经到 {marketSession?.quotes_of}；
+            盘中晋级股票不会改写历史复盘。
+          </span>
+          <span className="ml-auto flex gap-2">
+            <Link className="underline underline-offset-2" to="/watch">查看今日连板</Link>
+            <Link className="underline underline-offset-2" to="/daily-review">查看盘中情绪</Link>
+          </span>
+        </div>
+      )}
 
       {err && <div className="glass rounded-xl border-danger/30 px-4 py-3 text-sm text-danger">出错：{err}</div>}
       {notice && <div className="glass rounded-xl border-primary/30 px-4 py-3 text-sm text-muted-foreground">{notice}</div>}

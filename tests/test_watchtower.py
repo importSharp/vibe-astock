@@ -92,3 +92,23 @@ def test_snapshot_groups_first_and_second_boards_with_live_status():
     assert snap["second_board"]["total"] == 1
     assert snap["second_board"]["sealed"] == 1
     assert [r["code"] for r in snap["lianban3"]] == ["000004"]
+    assert snap["date"]
+
+
+@pytest.mark.unit
+def test_lianban3_uses_current_board_pool_without_date_fallback(monkeypatch):
+    """三板榜必须和首板/二板同源，不能在盘中悄悄回退到昨天。"""
+    current = [
+        {"code": "603421", "name": "今日三板", "boards": 3, "is_limit": True},
+        {"code": "000002", "name": "今日三板炸板", "boards": 3, "is_limit": False},
+        {"code": "000003", "name": "今日二板", "boards": 2, "is_limit": True},
+    ]
+
+    def forbidden_pool(*_args, **_kwargs):
+        raise AssertionError("三板榜不应再次查询或向前回溯独立股票池")
+
+    monkeypatch.setattr(wt.astock, "em_zt_topic_pool", forbidden_pool)
+    rows = wt._lianban3(current)
+
+    assert [r["code"] for r in rows] == ["603421", "000002"]
+    assert rows[1]["is_limit"] is False

@@ -169,7 +169,7 @@ export interface MonitorAlert {
   ts: string; code: string; name: string; kind: string; msg: string; sources: string[];
 }
 export interface MonitorSnapshot {
-  ts: string; phase: "open" | "break" | "closed"; poll_seconds: number;
+  date: string; ts: string; phase: "open" | "break" | "closed"; poll_seconds: number;
   holdings: WatchRow[]; watchlist: WatchRow[];
   bigcap: { total: number; top: WatchRow[] };
   first_board: { total: number; sealed: number; broken: number; stocks: WatchRow[] };

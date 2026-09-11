@@ -171,7 +171,7 @@ export function DailyWatch() {
           {phase === "open" && <Loader2 className="h-3 w-3 animate-spin" />}
           {PHASE_LABEL[phase]}
         </span>
-        {snap?.ts && <span>快照 {snap.ts}</span>}
+        {snap?.ts && <span>数据日 {snap.date} · 快照 {snap.ts}</span>}
         <span>监控池：500亿大票 {snap?.bigcap.total ?? 0} 只 + 首板/二板/三板+/持仓/自选/昨十</span>
         <span className="inline-flex items-center gap-1"><BellRing className="h-3.5 w-3.5" /> 今日异动 {snap?.alerts.length ?? 0} 条</span>
         {err && <span className="text-danger">{err}</span>}
@@ -261,7 +261,7 @@ export function DailyWatch() {
         <GlassCard>
           <div className="mb-2 flex items-center gap-2 text-sm font-semibold">
             <Flame className="h-4 w-4 text-primary" /> 三板以上
-            <span className="text-xs font-normal text-muted-foreground">封/开实时</span>
+            <span className="text-xs font-normal text-muted-foreground">今日触板池 · 封/开实时</span>
           </div>
           <QuoteTable rows={snap?.lianban3 ?? []} cols={["boards", "amount"]} watch={watch} onToggleWatch={toggleWatch} />
         </GlassCard>
