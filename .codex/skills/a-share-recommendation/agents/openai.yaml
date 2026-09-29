@@ -1,0 +1,6 @@
+interface:
+  display_name: "A股推荐 Skill"
+  short_description: "筛选40元以下沪深主板首板的次日1进2候选"
+  default_prompt: "使用 $a-share-recommendation 分析今日价格低于40元的沪深主板真实首板，并给出明日三个兼顾涨停可能性与可买性的1进2条件候选。"
+policy:
+  allow_implicit_invocation: true

@@ -108,6 +108,7 @@ def _theme_index(facts: dict) -> tuple[dict[str, dict], dict[str, list[dict]]]:
         for t in ((facts.get("theme_structure") or {}).get("themes") or [])
         if t.get("sector")
     }
+
     tags: dict[str, list[dict]] = {}
     for theme in ((facts.get("theme_tree") or {}).get("themes") or []):
         for member in theme.get("members") or []:

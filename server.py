@@ -20,7 +20,9 @@ from pydantic import BaseModel, Field
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from duanxian import live_emotion, overseas, preflight, reflection, review_store, trade_calendar
+from duanxian import (
+    live_emotion, overseas, preflight, recommendation, reflection, review_store, trade_calendar,
+)
 from duanxian.review_store import md_to_html as _md_to_html, strip_prefix as _strip_prefix
 from duanxian.config import make_llm
 from duanxian.review_graph import build_review_graph
@@ -1534,9 +1536,22 @@ def _intraday_scheduler() -> None:
                         #    数据源未更新或瞬时超时就被永久放弃，白白浪费后面的重试窗口。
                         if r.get("ok"):
                             done.add(key)
+                            if slot == "09:25":
+                                auction = recommendation.auction_result(today, persist=True)
+                                if not auction.get("available"):
+                                    print(f"⚠️ 竞价推荐未生成：{auction.get('reason')}")
                         else:
                             print(f"⚠️ 盘中快照 {slot} 失败（窗口内会重试）：{r.get('reason')}")
                         break
+                post_key = f"{today}#post-market-recommendation"
+                post_start = recommendation.official_snapshot_time()
+                post_end = _plus_minutes(post_start, 15)
+                if post_key not in done and post_start <= hhmm <= post_end:
+                    post = recommendation.post_market(today, generate=True)
+                    if post.get("available"):
+                        done.add(post_key)
+                    else:
+                        print(f"⚠️ 盘后推荐未生成（窗口内会重试）：{post.get('reason')}")
         except Exception as exc:  # noqa: BLE001  调度线程绝不能死
             print(f"⚠️ 盘中调度异常：{type(exc).__name__}: {exc}")
         time.sleep(60)
@@ -1611,6 +1626,26 @@ def api_intraday_path(date: str | None = None):
         return JSONResponse(intraday.path_summary(date))
     except Exception as exc:  # noqa: BLE001
         return JSONResponse({"available": False, "reason": f"{type(exc).__name__}: {exc}"})
+
+
+@app.get("/api/recommendation/post-market")
+def api_recommendation_post_market(date: str | None = None):
+    """盘后三只固定1进2候选；当天收盘后缺失时允许生成一次正式快照。"""
+    try:
+        return JSONResponse(recommendation.post_market(date, generate=True))
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"available": False, "stage": "post_market",
+                             "reason": f"{type(exc).__name__}: {exc}"})
+
+
+@app.get("/api/recommendation/auction")
+def api_recommendation_auction(date: str | None = None):
+    """次日09:25竞价确认；只重排昨晚三只，不换股。"""
+    try:
+        return JSONResponse(recommendation.auction_result(date, persist=True))
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"available": False, "stage": "auction",
+                             "reason": f"{type(exc).__name__}: {exc}"})
 
 
 @app.post("/api/intraday/capture")

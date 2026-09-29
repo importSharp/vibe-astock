@@ -40,7 +40,8 @@ _DIR = os.path.expanduser("~/.duanxian-agents/intraday")
 SNAPSHOT_SLOTS = ["09:25", "09:35", "10:00", "11:30", "14:00", "15:00"]
 
 # 快照结构版本，改字段就 +1
-_SNAP_SCHEMA = 3   # v3：加盘面家数(live) + 覆盖率
+_SNAP_SCHEMA = 4   # v4：保存昨日涨停股逐股竞价涨跌幅，供锁定候选做二次确认
+_SUPPORTED_SNAP_SCHEMAS = {3, 4}
 
 # slot 与真实抓取时刻允许的最大偏差（分钟）。超过就不能算该时点的读数 ——
 # 竞价快照尤其敏感：09:25 的"高开占比"和 10:30 的实时涨幅完全是两回事。
@@ -136,6 +137,9 @@ def capture(slot: Optional[str] = None, date: Optional[str] = None) -> dict:
     tops = [{"code": r["code"], "name": r["name"], "boards": int(r.get("boards") or 1),
              "sector": r.get("sector") or "", "pct": round(v, 2)}
             for r, v in got if int(r.get("boards") or 1) == top_board]
+    stocks = [{"code": r["code"], "name": r["name"], "boards": int(r.get("boards") or 1),
+               "sector": r.get("sector") or "", "pct": round(v, 2)}
+              for r, v in got]
 
     snap = {
         "schema": _SNAP_SCHEMA,
@@ -159,6 +163,7 @@ def capture(slot: Optional[str] = None, date: Optional[str] = None) -> dict:
         },
         "top_boards": tops,
         "top_board_level": top_board,
+        "stocks": stocks,
         # 当时的盘面家数（涨停/炸板/跌停/最高板/题材数）—— 情绪路径靠它
         "live": live_counts,
         # 覆盖率（同 money_effect 口径）：只回来一小半时别拿它当全体读数
@@ -186,7 +191,7 @@ def load_day(date: Optional[str] = None) -> dict:
         try:
             with open(os.path.join(d, fn), encoding="utf-8") as fh:
                 s = json.load(fh)
-            if s.get("schema") == _SNAP_SCHEMA:
+            if s.get("schema") in _SUPPORTED_SNAP_SCHEMAS:
                 out.append(s)
         except Exception:  # noqa: BLE001
             continue
@@ -255,6 +260,9 @@ def auction_check(date: Optional[str] = None) -> dict:
         "by_tier": snap["by_tier"],
         "top_boards": snap["top_boards"],
         "top_board_level": snap["top_board_level"],
+        "stocks": snap.get("stocks") or [],
+        "coverage_rate": snap.get("coverage_rate"),
+        "expected_sample": snap.get("expected_sample"),
         "verification_early": early,
     }
 

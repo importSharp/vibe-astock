@@ -8,6 +8,7 @@ function pct(v: number | null | undefined): string {
   return v == null ? "样本不足" : `${Math.round(v * 100)}%`;
 }
 
+
 function amount(v: number | null | undefined): string {
   if (v == null) return "—";
   return v >= 100_000_000 ? `${(v / 100_000_000).toFixed(1)}亿` : `${(v / 10_000).toFixed(0)}万`;

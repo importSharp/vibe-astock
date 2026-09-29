@@ -191,6 +191,33 @@ export interface FirstBoardData {
   stocks: FirstBoardStock[];
 }
 
+export interface PostMarketCandidate {
+  code: string; name: string; sector: string; primary_industry: string;
+  score: number; status: string; slot_type: string; board_profile: string;
+  sector_phase?: string;
+  score_parts: { limit_up: number; buyability: number };
+  next_day_path?: { type: string; availability_grade: string; explanation: string };
+}
+export interface PostMarketRecommendation {
+  available: boolean; stage: "post_market"; date?: string; decision_for?: string | null;
+  generated_at?: string; locked?: boolean; reason?: string;
+  candidates?: PostMarketCandidate[];
+}
+export interface AuctionCandidate {
+  code: string; name: string; sector: string; primary_industry: string;
+  post_market_rank: number; post_market_score: number | null;
+  auction_rank: number; auction_pct: number | null; sector_peer_avg: number | null;
+  status: "竞价确认" | "等待换手" | "竞价淘汰" | "数据不足";
+  reasons: string[];
+}
+export interface AuctionRecommendation {
+  available: boolean; stage: "auction"; date?: string; post_market_date?: string;
+  captured_at?: string; locked_candidates?: boolean; coverage_rate?: number | null;
+  market_median?: number | null; reason?: string; data_scope?: string;
+  candidates?: AuctionCandidate[];
+  counts?: Record<string, number>;
+}
+
 // 全市场成交额榜（客观公开榜单）
 export interface TurnoverStock {
   code: string; name: string;
@@ -335,6 +362,8 @@ export const api = {
   emotion: () => get<ShortTermEmotion>("/market/emotion"),
   monitorSnapshot: (watch: string) => get<MonitorSnapshot>(`/monitor/snapshot?watch=${encodeURIComponent(watch)}`),
   firstBoard: () => get<FirstBoardData>("/market/first-board"),
+  postMarketRecommendation: () => get<PostMarketRecommendation>("/recommendation/post-market"),
+  auctionRecommendation: () => get<AuctionRecommendation>("/recommendation/auction"),
   turnoverTop: () => get<TurnoverTop>("/market/turnover-top"),
   globalIndices: () => get<GlobalIndex[]>("/global/indices"),
   globalStock: (symbol: string) => get<GlobalStock>(`/global/stock?symbol=${encodeURIComponent(symbol)}`),

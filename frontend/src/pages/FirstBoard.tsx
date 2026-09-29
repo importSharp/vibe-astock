@@ -1,11 +1,14 @@
 import { Fragment, useEffect, useState } from "react";
-import { Flame, Loader2, Sparkles, AlertCircle, X } from "lucide-react";
+import { Flame, Loader2, Sparkles, AlertCircle, X, MoonStar, TimerReset } from "lucide-react";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { GlassCard } from "@/components/ui/GlassCard";
 import { Caliber } from "@/components/ui/Caliber";
 import { Disclaimer } from "@/components/ui/Disclaimer";
 import { useDeepDive, DeepDivePanel, RunAllButton, type DiveItem } from "@/components/ui/DeepDive";
-import { api, type FirstBoardData, type FirstBoardStock } from "@/lib/api";
+import {
+  api, type AuctionRecommendation, type FirstBoardData, type FirstBoardStock,
+  type PostMarketRecommendation,
+} from "@/lib/api";
 
 const fmt = (v: number) => v.toLocaleString("zh-CN", { maximumFractionDigits: 2 });
 const yi = (v: number | null) => (v == null ? "—" : `${fmt(v / 1e8)} 亿`); // 元 → 亿
@@ -15,11 +18,17 @@ const dateLabel = (d: string) =>
 
 export function FirstBoard() {
   const [data, setData] = useState<FirstBoardData | null>(null);
+  const [postMarket, setPostMarket] = useState<PostMarketRecommendation | null>(null);
+  const [auction, setAuction] = useState<AuctionRecommendation | null>(null);
   const [loaded, setLoaded] = useState(false);
   const dd = useDeepDive("firstboard", data?.date || "");
 
   useEffect(() => {
-    api.firstBoard().then(setData).catch(() => {}).finally(() => setLoaded(true));
+    Promise.allSettled([
+      api.firstBoard().then(setData),
+      api.postMarketRecommendation().then(setPostMarket),
+      api.auctionRecommendation().then(setAuction),
+    ]).finally(() => setLoaded(true));
   }, []);
 
   const buildPrompt = (s: FirstBoardStock) =>
@@ -48,6 +57,93 @@ export function FirstBoard() {
         title="首板分析"
         subtitle="今日首板涨停股（连板数=1）· 涨停原因题材 · 每只可让 AI 深入分析"
       />
+
+      <div className="mb-4 grid gap-3 lg:grid-cols-2">
+        <GlassCard>
+          <div className="mb-3 flex items-center gap-2">
+            <MoonStar className="h-4 w-4 text-primary" />
+            <div>
+              <div className="text-sm font-bold">第一阶段 · 盘后推荐</div>
+              <div className="text-xs text-muted-foreground">
+                {postMarket?.date ? `${postMarket.date} 收盘定稿` : "最近收盘交易日"} · 三只名单锁定
+              </div>
+            </div>
+          </div>
+          {!postMarket ? (
+            <div className="py-5 text-sm text-muted-foreground">加载中…</div>
+          ) : !postMarket.available ? (
+            <div className="rounded-lg bg-warning/10 p-3 text-sm text-warning">
+              {postMarket.reason || "盘后推荐尚未生成"}
+            </div>
+          ) : (
+            <div className="space-y-2">
+              {(postMarket.candidates || []).map((s, i) => (
+                <div key={s.code} className="rounded-xl border border-border/50 bg-background/35 p-3">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="rounded-md bg-primary/10 px-2 py-0.5 text-xs font-bold text-primary">#{i + 1}</span>
+                    <span className="font-semibold">{s.name}</span>
+                    <span className="font-mono text-xs text-muted-foreground">{s.code}</span>
+                    <span className="ml-auto text-xs text-muted-foreground">总分 {s.score}</span>
+                  </div>
+                  <div className="mt-1.5 text-xs text-muted-foreground">
+                    {s.sector} · {s.sector_phase || "阶段未标注"} · {s.board_profile}
+                  </div>
+                  <div className="mt-1 text-xs">
+                    涨停潜力 {s.score_parts.limit_up} / 70 · 可买性 {s.score_parts.buyability} / 30
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </GlassCard>
+
+        <GlassCard>
+          <div className="mb-3 flex items-center gap-2">
+            <TimerReset className="h-4 w-4 text-primary" />
+            <div>
+              <div className="text-sm font-bold">第二阶段 · 09:25竞价确认</div>
+              <div className="text-xs text-muted-foreground">只确认、等待或淘汰昨晚三只，不临时换股</div>
+            </div>
+          </div>
+          {!auction ? (
+            <div className="py-5 text-sm text-muted-foreground">加载中…</div>
+          ) : !auction.available ? (
+            <div className="rounded-lg bg-muted p-3 text-sm text-muted-foreground">
+              {auction.reason || "等待下一交易日09:25竞价快照"}
+            </div>
+          ) : (
+            <div className="space-y-2">
+              {(auction.candidates || []).map((s) => {
+                const tone = s.status === "竞价确认"
+                  ? "bg-primary/10 text-primary"
+                  : s.status === "竞价淘汰"
+                    ? "bg-danger/10 text-danger"
+                    : "bg-warning/10 text-warning";
+                return (
+                  <div key={s.code} className="rounded-xl border border-border/50 bg-background/35 p-3">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className={`rounded-md px-2 py-0.5 text-xs font-bold ${tone}`}>{s.status}</span>
+                      <span className="font-semibold">{s.name}</span>
+                      <span className="font-mono text-xs text-muted-foreground">{s.code}</span>
+                      <span className="ml-auto font-mono text-sm font-bold">
+                        {s.auction_pct == null ? "—" : `${s.auction_pct > 0 ? "+" : ""}${s.auction_pct}%`}
+                      </span>
+                    </div>
+                    <div className="mt-1.5 text-xs text-muted-foreground">
+                      盘后#{s.post_market_rank} → 竞价#{s.auction_rank} · {s.sector}
+                      {s.sector_peer_avg == null ? "" : ` · 行业同批均值 ${s.sector_peer_avg > 0 ? "+" : ""}${s.sector_peer_avg}%`}
+                    </div>
+                    <div className="mt-1 text-xs">{s.reasons.join("；")}</div>
+                  </div>
+                );
+              })}
+              <div className="pt-1 text-[11px] leading-relaxed text-muted-foreground">
+                {auction.data_scope}
+              </div>
+            </div>
+          )}
+        </GlassCard>
+      </div>
 
       {data && (
         <div className="mb-4 grid grid-cols-3 gap-3">
