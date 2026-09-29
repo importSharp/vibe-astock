@@ -1,5 +1,7 @@
 import { Fragment, useEffect, useState } from "react";
-import { Flame, Loader2, Sparkles, AlertCircle, X, MoonStar, TimerReset } from "lucide-react";
+import {
+  Activity, AlertCircle, Flame, Leaf, Loader2, MoonStar, Sparkles, TimerReset, X,
+} from "lucide-react";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { GlassCard } from "@/components/ui/GlassCard";
 import { Caliber } from "@/components/ui/Caliber";
@@ -15,6 +17,9 @@ const yi = (v: number | null) => (v == null ? "—" : `${fmt(v / 1e8)} 亿`); //
 
 const dateLabel = (d: string) =>
   d.length === 8 ? `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6)}` : d;
+
+const ratio = (value: number | null | undefined) =>
+  value == null ? "数据缺失" : `${(value * 100).toFixed(1)}%`;
 
 export function FirstBoard() {
   const [data, setData] = useState<FirstBoardData | null>(null);
@@ -144,6 +149,102 @@ export function FirstBoard() {
           )}
         </GlassCard>
       </div>
+
+      {postMarket?.available && (
+        <div className="mb-4 grid gap-3 lg:grid-cols-[minmax(0,0.85fr)_minmax(0,1.15fr)]">
+          <GlassCard>
+            <div className="mb-3 flex flex-wrap items-center gap-2">
+              <Activity className="h-4 w-4 text-primary" />
+              <div className="text-sm font-bold">市场模式</div>
+              {postMarket.market_gate ? (
+                <span className={`ml-auto rounded-md px-2 py-0.5 text-xs font-bold ${
+                  postMarket.market_gate.open
+                    ? "bg-primary/10 text-primary"
+                    : "bg-warning/10 text-warning"
+                }`}>
+                  {postMarket.market_gate.mode}
+                </span>
+              ) : null}
+            </div>
+            {!postMarket.market_gate ? (
+              <div className="rounded-lg bg-muted p-3 text-sm text-muted-foreground">
+                当前正式快照未生成市场模式数据
+              </div>
+            ) : (
+              <>
+                <div className="mb-3 text-sm font-semibold">{postMarket.market_gate.state}</div>
+                <div className="grid grid-cols-2 gap-2">
+                  {[
+                    ["上涨家数占比", ratio(postMarket.market_gate.metrics?.breadth)],
+                    ["1进2晋级率", ratio(postMarket.market_gate.metrics?.promotion_rate)],
+                    ["炸板率", ratio(postMarket.market_gate.metrics?.break_rate)],
+                    ["涨停家数变化", ratio(postMarket.market_gate.metrics?.limit_retention)],
+                  ].map(([label, value]) => (
+                    <div key={label} className="rounded-lg border border-border/50 bg-background/35 p-2.5">
+                      <div className="text-[11px] text-muted-foreground">{label}</div>
+                      <div className="mt-0.5 font-mono text-sm font-bold">{value}</div>
+                    </div>
+                  ))}
+                </div>
+                {!!postMarket.market_gate.adverse_signals?.length && (
+                  <div className="mt-3 rounded-lg bg-warning/10 p-2.5 text-xs leading-relaxed text-warning">
+                    风险信号：{postMarket.market_gate.adverse_signals.join("；")}
+                  </div>
+                )}
+                {!!postMarket.market_gate.missing_metrics?.length && (
+                  <div className="mt-2 rounded-lg bg-muted p-2.5 text-xs leading-relaxed text-muted-foreground">
+                    缺失指标：{postMarket.market_gate.missing_metrics.join("；")}
+                  </div>
+                )}
+                {!postMarket.market_gate.adverse_signals?.length && !postMarket.market_gate.missing_metrics?.length && (
+                  <div className="mt-3 text-xs text-muted-foreground">四项指标当前未触发防守切换。</div>
+                )}
+                <div className="mt-2 text-[11px] leading-relaxed text-muted-foreground">
+                  {postMarket.market_gate.rule}；市场模式只作风险背景，不改变涨停潜力70%＋可买性30%的排序。
+                </div>
+              </>
+            )}
+          </GlassCard>
+
+          <GlassCard>
+            <div className="mb-3 flex flex-wrap items-center gap-2">
+              <Leaf className="h-4 w-4 text-primary" />
+              <div className="text-sm font-bold">发酵观察</div>
+              <span className="ml-auto rounded-md bg-warning/10 px-2 py-0.5 text-[11px] font-medium text-warning">
+                仅验证轮动 · 非买入名单
+              </span>
+            </div>
+            {!postMarket.fermentation_watchlist ? (
+              <div className="rounded-lg bg-muted p-3 text-sm text-muted-foreground">
+                当前正式快照未生成发酵观察数据
+              </div>
+            ) : postMarket.fermentation_watchlist.length === 0 ? (
+              <div className="rounded-lg bg-muted p-3 text-sm text-muted-foreground">
+                当前快照未发现独立的低位发酵方向
+              </div>
+            ) : (
+              <div className="space-y-2">
+                {postMarket.fermentation_watchlist.map((item) => (
+                  <div key={item.code} className="rounded-xl border border-border/50 bg-background/35 p-3">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="rounded-md bg-primary/10 px-2 py-0.5 text-xs font-bold text-primary">
+                        {item.sector}
+                      </span>
+                      <span className="font-semibold">{item.name}</span>
+                      <span className="font-mono text-xs text-muted-foreground">{item.code}</span>
+                      <span className="ml-auto text-xs text-muted-foreground">观察分 {item.score}</span>
+                    </div>
+                    <div className="mt-1.5 text-xs text-muted-foreground">
+                      {item.sector_phase} · {item.board_profile}
+                    </div>
+                    <div className="mt-1 text-xs leading-relaxed">{item.reason}</div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </GlassCard>
+        </div>
+      )}
 
       {data && (
         <div className="mb-4 grid grid-cols-3 gap-3">

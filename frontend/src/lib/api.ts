@@ -198,10 +198,34 @@ export interface PostMarketCandidate {
   score_parts: { limit_up: number; buyability: number };
   next_day_path?: { type: string; availability_grade: string; explanation: string };
 }
+export interface MarketGateMetrics {
+  breadth: number | null;
+  promotion_rate: number | null;
+  break_rate: number | null;
+  limit_retention: number | null;
+}
+export interface MarketGate {
+  open: boolean;
+  mode: "进攻模式" | "防守模式" | string;
+  state: string;
+  adverse_signals: string[];
+  missing_metrics: string[];
+  metrics: MarketGateMetrics;
+  rule: string;
+  data_error?: string;
+}
+export interface FermentationWatchItem {
+  code: string; name: string; sector: string;
+  sector_phase: string; board_profile: string;
+  score: number; status: "发酵观察" | string;
+  action: string; reason: string;
+}
 export interface PostMarketRecommendation {
   available: boolean; stage: "post_market"; date?: string; decision_for?: string | null;
   generated_at?: string; locked?: boolean; reason?: string;
   candidates?: PostMarketCandidate[];
+  market_gate?: MarketGate;
+  fermentation_watchlist?: FermentationWatchItem[];
 }
 export interface AuctionCandidate {
   code: string; name: string; sector: string; primary_industry: string;
